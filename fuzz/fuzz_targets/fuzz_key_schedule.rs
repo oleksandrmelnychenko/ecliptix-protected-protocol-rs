@@ -23,14 +23,15 @@ fuzz_target!(|data: &[u8]| {
         let prev_init = &data[..32];
         let commit_secret = &data[32..64];
         let ctx_hash = &data[64..96];
-        let _ = GroupKeySchedule::derive_epoch_keys(prev_init, commit_secret, ctx_hash);
+        let _ = GroupKeySchedule::derive_epoch_keys(prev_init, commit_secret, ctx_hash, false);
+        let _ = GroupKeySchedule::derive_epoch_keys(prev_init, commit_secret, ctx_hash, true);
         let _ = GroupKeySchedule::derive_sender_key_base(epoch_secret, 0, ctx_hash);
         let _ = GroupKeySchedule::compute_confirmation_mac(epoch_secret, ctx_hash);
     }
 
     let group_id = &data[..std::cmp::min(data.len(), 32)];
     let tree_hash = if data.len() >= 64 { &data[32..64] } else { epoch_secret };
-    let _ = GroupKeySchedule::compute_group_context_hash(group_id, 0, tree_hash);
+    let _ = GroupKeySchedule::compute_group_context_hash(group_id, 0, tree_hash, &[]);
 
     if data.len() >= 96 {
         let psk = &data[32..64];
