@@ -1,0 +1,281 @@
+/*
+ * Ecliptix Protection Protocol — Handshake-Only Tamarin Model
+ *
+ * Simplified model focusing on the Hybrid X3DH key exchange.
+ *
+ * DESIGN CHOICES:
+ *   - Uses `builtins: diffie-hellman` with TWO DH operations:
+ *       DH1 = SPK_R ^ IK_I   (identity binding — uses initiator's LT key)
+ *       DH2 = IK_R  ^ EK_I   (forward secrecy — uses ephemeral key)
+ *     These match X3DH DH operations 1 and 2 respectively.
+ *     DH1 prevents impersonation (needs ik_priv_I or spk_priv_R).
+ *     DH2 provides forward secrecy (ephemeral key erased after use).
+ *   - Kyber KEM modeled faithfully with encaps/decaps equation.
+ *   - HKDF/HMAC → h() (collision-resistant hash).
+ *   - Single !Keys fact links private and public keys from the same
+ *     Generate_Keys instance, preventing cross-instance mismatches.
+ *
+ * Compromise hierarchy:
+ *   - Reveal_All (FullCompromise): IK + SPK + Kyber SK — total break
+ *   - Reveal_Classical (Compromise): IK + SPK only — DH broken, Kyber intact
+ *
+ * Properties verified:
+ *   1. session_key_secrecy — hybrid root secret absent any compromise
+ *   2. mutual_authentication — bilateral key confirmation prevents UKS
+ *   3. responder_authentication — symmetric authentication guarantee
+ *   4. forward_secrecy_hybrid — past sessions safe after classical-only compromise
+ *   5. key_confirmation — same-session parties derive same key
+ *   6. session_exists — reachability / sanity check
+ *
+ * Reference: src/protocol/handshake.rs, docs/security-proof.tex Theorems 2-3
+ */
+
+theory EcliptixHandshake
+begin
+
+builtins: diffie-hellman, hashing, signing
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §1  Function Symbols & Equations — KEM only
+// ═══════════════════════════════════════════════════════════════════════════════
+
+functions:
+    kyber_pk/1,
+    kyber_encaps/2,
+    kyber_decaps/2
+
+equations:
+    kyber_decaps(kyber_encaps(ss, kyber_pk(sk)), sk) = ss
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §2  Restrictions
+// ═══════════════════════════════════════════════════════════════════════════════
+
+restriction Equality:
+    "All x y #i. Eq(x, y) @i ==> x = y"
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §3  Key Generation & Bundle Publication
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/*
+ * Combined key generation: produces a single !Keys fact that links
+ * private keys with their corresponding public keys. This ensures
+ * any rule matching both private and public keys of a party
+ * always uses keys from the same generation instance.
+ */
+rule Generate_Keys:
+    let ik_pub  = 'g'^~ik_priv
+        spk_pub = 'g'^~spk_priv
+        kpk     = kyber_pk(~kyber_sk)
+    in
+    [ Fr(~ik_priv), Fr(~spk_priv), Fr(~kyber_sk) ]
+  --[ GenerateKeys($A) ]->
+    [ !Keys($A, ~ik_priv, ~spk_priv, ~kyber_sk, ik_pub, spk_pub, kpk),
+      Out(ik_pub), Out(spk_pub), Out(kpk) ]
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §4  Hybrid X3DH Handshake
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/*
+ * Initiator: Hybrid X3DH.
+ *
+ * DH1 = SPK_R ^ ik_priv_I   (identity key × signed pre-key)
+ * DH2 = IK_R  ^ ek_priv     (ephemeral × identity)
+ *
+ * Initiator uses own !Keys and reads responder's authenticated !Keys.
+ */
+rule Initiator_X3DH:
+    let ek_pub    = 'g'^~ek_priv
+        /* DH1: identity × pre-key (authentication) */
+        dh1       = spk_pub_R^~ik_priv_I
+        /* DH2: ephemeral × identity (forward secrecy) */
+        dh2       = ik_pub_R^~ek_priv
+        /* Kyber encapsulation */
+        kyber_ct  = kyber_encaps(~kyber_ss, kpk_R)
+        /* Hybrid root */
+        hybrid_root = h(<'hybrid', ~kyber_ss, dh1, dh2>)
+        /* Key confirmation */
+        kc_init   = h(<'kc-init', hybrid_root>)
+        kc_resp   = h(<'kc-resp', hybrid_root>)
+        t_hash    = h(<'transcript', ik_pub_I, ik_pub_R, ek_pub, kyber_ct, spk_pub_R>)
+        init_mac  = h(<'hmac', kc_init, t_hash>)
+        expect_ack = h(<'hmac', kc_resp, t_hash>)
+    in
+    [ !Keys($I, ~ik_priv_I, spk_priv_I, kyber_sk_I, ik_pub_I, spk_pub_I, kpk_I),
+      !Keys($R, ik_priv_R, spk_priv_R, kyber_sk_R, ik_pub_R, spk_pub_R, kpk_R),
+      Fr(~ek_priv), Fr(~kyber_ss) ]
+  --[ InitStarted($I, $R, hybrid_root),
+      InitRunning($I, $R, t_hash) ]->
+    [ Out(<ik_pub_I, ek_pub, kyber_ct, init_mac>),
+      InitWait($I, $R, hybrid_root, expect_ack, t_hash) ]
+
+/*
+ * Responder: Process init, verify MAC, produce ack.
+ *
+ * DH1 = IK_I  ^ spk_priv_R  (= SPK_R ^ ik_priv_I by commutativity)
+ * DH2 = EK_I  ^ ik_priv_R   (= IK_R ^ ek_priv by commutativity)
+ */
+rule Responder_X3DH:
+    let /* DH1: pre-key × identity (mirror of initiator DH1) */
+        dh1       = ik_pub_I^~spk_priv_R
+        /* DH2: identity × ephemeral (mirror of initiator DH2) */
+        dh2       = ek_pub_I^~ik_priv_R
+        /* Kyber decapsulation */
+        kyber_ss  = kyber_decaps(kyber_ct, ~kyber_sk_R)
+        /* Hybrid root */
+        hybrid_root = h(<'hybrid', kyber_ss, dh1, dh2>)
+        /* Key confirmation */
+        kc_init   = h(<'kc-init', hybrid_root>)
+        kc_resp   = h(<'kc-resp', hybrid_root>)
+        t_hash    = h(<'transcript', ik_pub_I, ik_pub_R, ek_pub_I, kyber_ct, spk_pub_R>)
+        expect_mac = h(<'hmac', kc_init, t_hash>)
+        ack_mac   = h(<'hmac', kc_resp, t_hash>)
+    in
+    [ !Keys($R, ~ik_priv_R, ~spk_priv_R, ~kyber_sk_R, ik_pub_R, spk_pub_R, kpk_R),
+      /* Authenticate initiator's identity via trusted directory (TOFU/PKI) */
+      !Keys($I, ik_priv_I, spk_priv_I, kyber_sk_I, ik_pub_I, spk_pub_I, kpk_I),
+      In(<ik_pub_I, ek_pub_I, kyber_ct, init_mac>) ]
+  --[ Eq(init_mac, expect_mac),
+      RespAccepted($R, $I, hybrid_root),
+      RespRunning($R, $I, t_hash) ]->
+    [ Out(ack_mac),
+      RespSession($R, $I, hybrid_root, t_hash) ]
+
+rule Initiator_Finish:
+    [ InitWait($I, $R, hybrid_root, expect_ack, t_hash),
+      In(ack_mac) ]
+  --[ Eq(ack_mac, expect_ack),
+      InitCompleted($I, $R, hybrid_root),
+      InitCommit($I, $R, t_hash),
+      SessionKey($I, $R, 'initiator', hybrid_root),
+      Established($I, $R, hybrid_root) ]->
+    [ ]
+
+rule Responder_Finish:
+    [ RespSession($R, $I, hybrid_root, t_hash) ]
+  --[ RespCompleted($R, $I, hybrid_root),
+      RespCommit($R, $I, t_hash),
+      SessionKey($R, $I, 'responder', hybrid_root),
+      Established($R, $I, hybrid_root) ]->
+    [ ]
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §5  Compromise Rules
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/*
+ * Full key compromise: reveals IK + SPK + Kyber SK.
+ * Emits both Compromise and FullCompromise action facts.
+ * This models a total break of the party's long-term state.
+ */
+rule Reveal_All:
+    [ !Keys($A, ~ik_priv, ~spk_priv, ~kyber_sk, ik_pub, spk_pub, kpk) ]
+  --[ Compromise($A), FullCompromise($A) ]->
+    [ Out(~ik_priv), Out(~spk_priv), Out(~kyber_sk) ]
+
+/*
+ * Classical-only compromise: reveals IK + SPK but NOT Kyber SK.
+ * Models a scenario where DH keys are broken (e.g., quantum adversary
+ * or side-channel on classical keys) but Kyber remains secure.
+ *
+ * Key insight: with classical-only compromise AFTER a session,
+ * the adversary can compute DH1 and DH2 but NOT Kyber_SS,
+ * so the hybrid_root remains secret (hash preimage resistance).
+ */
+rule Reveal_Classical:
+    [ !Keys($A, ~ik_priv, ~spk_priv, ~kyber_sk, ik_pub, spk_pub, kpk) ]
+  --[ Compromise($A) ]->
+    [ Out(~ik_priv), Out(~spk_priv) ]
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §6  Security Lemmas
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/*
+ * LEMMA 1: Session Key Secrecy (Theorem 2)
+ *
+ * The session key is secret unless some party is compromised.
+ * Covers both classical and full compromise.
+ */
+lemma session_key_secrecy:
+    "All A B role k #i.
+        SessionKey(A, B, role, k) @i
+        ==> not(Ex #j. K(k) @j)
+            | (Ex #r. Compromise(A) @r)
+            | (Ex #r. Compromise(B) @r)"
+
+/*
+ * LEMMA 2: Mutual Authentication (Theorem 2, Lemma 2.1)
+ *
+ * If initiator commits, responder was running (or some party compromised).
+ */
+lemma mutual_authentication:
+    "All A B t #i.
+        InitCommit(A, B, t) @i
+        ==> (Ex #j. RespRunning(B, A, t) @j & j < i)
+            | (Ex #r. Compromise(A) @r)
+            | (Ex #r. Compromise(B) @r)"
+
+/*
+ * LEMMA 3: Responder Authentication
+ *
+ * If responder commits, initiator was running (or some party compromised).
+ */
+lemma responder_authentication:
+    "All B A t #i.
+        RespCommit(B, A, t) @i
+        ==> (Ex #j. InitRunning(A, B, t) @j & j < i)
+            | (Ex #r. Compromise(A) @r)
+            | (Ex #r. Compromise(B) @r)"
+
+/*
+ * LEMMA 4: Hybrid Forward Secrecy (Theorem 3)
+ *
+ * The Kyber component provides forward secrecy against classical-only
+ * compromise. If only DH keys are revealed (IK + SPK), the adversary
+ * can compute DH1 and DH2 but NOT the Kyber shared secret, so the
+ * hybrid root remains secret.
+ *
+ * Formally: if the adversary learns the session key, then EITHER:
+ *   - Some compromise happened BEFORE the session (active impersonation)
+ *   - OR full compromise (including Kyber SK) happened at some point
+ *
+ * Crucially: classical-only compromise AFTER the session does NOT
+ * reveal the session key. This is the hybrid forward secrecy guarantee.
+ */
+lemma forward_secrecy_hybrid:
+    "All A B role k #i #j.
+        SessionKey(A, B, role, k) @i & K(k) @j
+        ==> (Ex #r. Compromise(A) @r & r < i)
+            | (Ex #r. Compromise(B) @r & r < i)
+            | (Ex #r. FullCompromise(A) @r)
+            | (Ex #r. FullCompromise(B) @r)"
+
+/*
+ * LEMMA 5: Key Confirmation (Lemma 2.1)
+ *
+ * If initiator and responder complete the same session (identified by
+ * matching transcript hash t), they derive the same session key.
+ * This follows from DH commutativity and Kyber correctness.
+ */
+lemma key_confirmation:
+    "All A B k1 k2 t #i #j.
+        InitCommit(A, B, t) @i
+        & SessionKey(A, B, 'initiator', k1) @i
+        & RespCommit(B, A, t) @j
+        & SessionKey(B, A, 'responder', k2) @j
+        ==> k1 = k2"
+
+/*
+ * LEMMA 6: Session Exists (Sanity / Reachability)
+ */
+lemma session_exists:
+    exists-trace
+    "Ex A B k #i #j.
+        Established(A, B, k) @i
+        & Established(B, A, k) @j
+        & not(A = B)"
+
+end

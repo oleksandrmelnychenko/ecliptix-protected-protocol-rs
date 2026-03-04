@@ -1,0 +1,185 @@
+[package]
+name = "ecliptix-protocol-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+prost = "0.14"
+zeroize = "1.8"
+
+[dependencies.ecliptix-protocol]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[profile.release]
+opt-level = 3
+debug = true
+
+[[bin]]
+name = "fuzz_handshake_init"
+path = "fuzz_targets/fuzz_handshake_init.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_commit_processing"
+path = "fuzz_targets/fuzz_commit_processing.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_welcome_processing"
+path = "fuzz_targets/fuzz_welcome_processing.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_group_message_decrypt"
+path = "fuzz_targets/fuzz_group_message_decrypt.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_sealed_state_deserialize"
+path = "fuzz_targets/fuzz_sealed_state_deserialize.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_envelope_decrypt"
+path = "fuzz_targets/fuzz_envelope_decrypt.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_aes_gcm"
+path = "fuzz_targets/fuzz_aes_gcm.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_padding"
+path = "fuzz_targets/fuzz_padding.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_shamir"
+path = "fuzz_targets/fuzz_shamir.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_hkdf"
+path = "fuzz_targets/fuzz_hkdf.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_protobuf_decode"
+path = "fuzz_targets/fuzz_protobuf_decode.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_handshake_ack"
+path = "fuzz_targets/fuzz_handshake_ack.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_dh_validator"
+path = "fuzz_targets/fuzz_dh_validator.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_kyber"
+path = "fuzz_targets/fuzz_kyber.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_secure_memory"
+path = "fuzz_targets/fuzz_secure_memory.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_master_key_derivation"
+path = "fuzz_targets/fuzz_master_key_derivation.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_nonce"
+path = "fuzz_targets/fuzz_nonce.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_key_schedule"
+path = "fuzz_targets/fuzz_key_schedule.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_sender_key"
+path = "fuzz_targets/fuzz_sender_key.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_key_package_validate"
+path = "fuzz_targets/fuzz_key_package_validate.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_relay"
+path = "fuzz_targets/fuzz_relay.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_tree_deserialize"
+path = "fuzz_targets/fuzz_tree_deserialize.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_tree_kem"
+path = "fuzz_targets/fuzz_tree_kem.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_membership"
+path = "fuzz_targets/fuzz_membership.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_commit_create"
+path = "fuzz_targets/fuzz_commit_create.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_welcome_roundtrip"
+path = "fuzz_targets/fuzz_welcome_roundtrip.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_update_path"
+path = "fuzz_targets/fuzz_update_path.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_tree_operations"
+path = "fuzz_targets/fuzz_tree_operations.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_session_state"
+path = "fuzz_targets/fuzz_session_state.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_e2e_proto"
+path = "fuzz_targets/fuzz_e2e_proto.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_ffi"
+path = "fuzz_targets/fuzz_ffi.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_identity"
+path = "fuzz_targets/fuzz_identity.rs"
+doc = false

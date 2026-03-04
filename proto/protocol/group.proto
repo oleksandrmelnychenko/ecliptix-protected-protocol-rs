@@ -1,0 +1,288 @@
+syntax = "proto3";
+
+package ecliptix.proto.protocol;
+option csharp_namespace = "Ecliptix.Protobuf.Protocol";
+
+import "google/protobuf/timestamp.proto";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// KeyPackage: a member's credential published for group joining
+// ─────────────────────────────────────────────────────────────────────────────
+
+message GroupKeyPackage {
+  uint32 version = 1;
+  bytes identity_ed25519_public = 2;   // 32 bytes — long-term signing identity
+  bytes identity_x25519_public = 3;    // 32 bytes — long-term DH identity
+  bytes leaf_x25519_public = 4;        // 32 bytes — leaf DH public for TreeKEM
+  bytes leaf_kyber_public = 5;         // 1184 bytes — leaf Kyber-768 public
+  bytes signature = 6;                 // Ed25519 over (version || leaf keys || credential)
+  bytes credential = 7;               // Application-layer credential (e.g., user ID)
+  google.protobuf.Timestamp created_at = 8;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tree Node (serialized ratchet tree for state persistence / Welcome)
+// ─────────────────────────────────────────────────────────────────────────────
+
+message GroupTreeNode {
+  uint32 node_index = 1;
+  bytes x25519_public = 2;            // 32 bytes, empty if blank
+  bytes kyber_public = 3;             // 1184 bytes, empty if blank
+  bytes x25519_private = 4;           // 32 bytes, only for own direct path (never on wire)
+  bytes kyber_secret = 5;             // 2400 bytes, only for own direct path (never on wire)
+  bytes parent_hash = 6;              // 32 bytes SHA-256 for tree integrity
+  optional GroupKeyPackage key_package = 7;  // Leaf nodes only
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Proposals
+// ─────────────────────────────────────────────────────────────────────────────
+
+message GroupProposal {
+  oneof proposal {
+    GroupAddProposal add = 1;
+    GroupRemoveProposal remove = 2;
+    GroupUpdateProposal update = 3;
+    GroupExternalInitProposal external_init = 4;
+    GroupPskProposal psk = 5;
+    GroupReInitProposal re_init = 6;
+  }
+}
+
+message GroupExternalInitProposal {
+  bytes ephemeral_x25519_public = 1;  // 32 bytes
+  bytes kyber_ciphertext = 2;          // 1088 bytes
+}
+
+// Pre-Shared Key injection (MLS RFC 9420 §12.2).
+// Injects external entropy into the key schedule for additional security.
+message GroupPskProposal {
+  bytes psk_id = 1;                   // Opaque identifier for the PSK
+  bytes psk_nonce = 2;                // 32 bytes — unique per use, mixed into key schedule
+}
+
+// ReInit proposal (MLS RFC 9420 §12.4).
+// Signals that the group should migrate to a new group with new parameters.
+message GroupReInitProposal {
+  bytes new_group_id = 1;             // 32 bytes — ID for the new group
+  uint32 new_version = 2;             // Protocol version for the new group
+}
+
+message GroupAddProposal {
+  GroupKeyPackage key_package = 1;
+}
+
+message GroupRemoveProposal {
+  uint32 removed_leaf_index = 1;
+}
+
+message GroupUpdateProposal {
+  bytes leaf_x25519_public = 1;       // 32 bytes
+  bytes leaf_kyber_public = 2;        // 1184 bytes
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Commit: TreeKEM path update (triggers epoch advancement)
+// ─────────────────────────────────────────────────────────────────────────────
+
+message GroupCommit {
+  uint32 committer_leaf_index = 1;
+  repeated GroupProposal proposals = 2;
+  GroupUpdatePath update_path = 3;
+  bytes confirmation_mac = 4;         // HMAC-SHA256(confirmation_key, group_context_hash)
+  uint64 epoch = 5;
+  bytes group_id = 6;                 // 32 bytes
+  bytes committer_signature = 7;      // Ed25519(committer_ed25519_sk, commit_without_sig)
+}
+
+message GroupUpdatePath {
+  bytes leaf_x25519_public = 1;       // 32 bytes — new leaf DH public
+  bytes leaf_kyber_public = 2;        // 1184 bytes — new leaf Kyber public
+  repeated GroupUpdatePathNode nodes = 3;  // One per internal node on direct path
+}
+
+message GroupUpdatePathNode {
+  bytes x25519_public = 1;            // 32 bytes
+  bytes kyber_public = 2;             // 1184 bytes
+  repeated GroupHybridCiphertext encrypted_path_secrets = 3;
+  bytes parent_hash = 4;              // 32 bytes SHA-256, binds node to parent path
+}
+
+// Hybrid ciphertext: X25519 ephemeral DH + Kyber-768 KEM + AES-256-GCM-SIV
+message GroupHybridCiphertext {
+  bytes ephemeral_x25519_public = 1;  // 32 bytes
+  bytes kyber_ciphertext = 2;         // 1088 bytes
+  bytes encrypted_secret = 3;         // AES-256-GCM-SIV(hybrid_key, path_secret)
+  bytes nonce = 4;                    // 12 bytes
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Welcome: sent to newly added members (via existing pairwise session or OOB)
+// ─────────────────────────────────────────────────────────────────────────────
+
+message GroupWelcome {
+  uint32 version = 1;
+  bytes group_id = 2;                 // 32 bytes
+  uint64 epoch = 3;
+  bytes encrypted_group_info = 4;     // AES-256-GCM-SIV(welcome_key, GroupInfo)
+  bytes welcome_nonce = 5;            // 12 bytes
+  GroupHybridCiphertext encrypted_joiner_secret = 6;
+  bytes tree_hash = 7;                // SHA-256 commitment to tree state
+  uint32 target_leaf_index = 8;       // Leaf index of the new member (avoids brute-force search)
+}
+
+message GroupInfo {
+  bytes group_id = 1;                 // 32 bytes
+  uint64 epoch = 2;
+  repeated GroupTreeNode tree_nodes = 3;  // Full public tree (no private keys)
+  bytes group_context_hash = 4;       // SHA-256(group_id || epoch || tree_hash || policy_bytes)
+  bytes confirmation_mac = 5;         // HMAC-SHA256(confirmation_key, group_context_hash)
+  bytes security_policy = 6;          // Serialized GroupSecurityPolicy, bound into context hash
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Group Messages (application layer)
+// ─────────────────────────────────────────────────────────────────────────────
+
+message GroupMessage {
+  uint32 version = 1;
+  bytes group_id = 2;                 // 32 bytes
+  uint64 epoch = 3;
+
+  oneof content {
+    GroupApplicationMessage application = 4;
+    GroupCommit commit = 5;
+    GroupWelcome welcome = 6;
+  }
+}
+
+message GroupApplicationMessage {
+  bytes encrypted_sender_data = 1;    // AES-256-GCM-SIV(metadata_key, SenderData)
+  bytes sender_data_nonce = 2;        // 12 bytes
+  bytes encrypted_payload = 3;        // AES-256-GCM-SIV(message_key, GroupPlaintext)
+  bytes payload_nonce = 4;            // 12 bytes
+  bytes franking_tag = 5;             // HMAC-SHA256(franking_key, content), 32 bytes. Empty if not frankable.
+  bytes sender_signature = 6;         // Ed25519 over canonicalized authenticated message fields.
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public Group State (exported for External Join)
+// ─────────────────────────────────────────────────────────────────────────────
+
+message GroupPublicState {
+  uint32 version = 1;
+  bytes group_id = 2;                 // 32 bytes
+  uint64 epoch = 3;
+  repeated GroupTreeNode tree_nodes = 4;  // Public tree only (no private keys)
+  bytes group_context_hash = 5;
+  bytes confirmation_mac = 6;
+  bytes external_x25519_public = 7;   // 32 bytes — derived from init_secret
+  bytes external_kyber_public = 8;    // 1184 bytes — derived from init_secret
+  bytes security_policy = 9;          // Serialized GroupSecurityPolicy (immutable)
+}
+
+message GroupSenderData {
+  uint32 sender_leaf_index = 1;
+  uint32 generation = 2;
+  bytes reuse_guard = 3;              // 4 random bytes XORed into nonce (MLS-style)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Message Features: Sealed Messages, Disappearing Messages, Message Franking
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum GroupContentType {
+  GROUP_CONTENT_NORMAL = 0;
+  GROUP_CONTENT_SEALED = 1;
+  GROUP_CONTENT_DISAPPEARING = 2;
+  GROUP_CONTENT_SEALED_DISAPPEARING = 3;
+  GROUP_CONTENT_EDIT = 4;
+  GROUP_CONTENT_DELETE = 5;
+}
+
+message GroupMessagePolicy {
+  GroupContentType content_type = 1;
+  uint32 ttl_seconds = 2;            // Time-to-live in seconds (0 = no expiry)
+  uint64 sent_timestamp = 3;         // Unix epoch seconds when sender created the message
+}
+
+// Structured plaintext envelope (replaces raw bytes inside encrypted_payload).
+// All group messages are serialised as GroupPlaintext before encryption.
+message GroupPlaintext {
+  bytes content = 1;                  // Actual message content (or hint for sealed messages)
+  GroupMessagePolicy policy = 2;      // Message delivery policy
+  bytes franking_key = 3;            // 32 bytes random, present if frankable
+  bytes sealed_content = 4;          // AES-256-GCM-SIV(seal_key, actual_content), present if sealed
+  bytes sealed_nonce = 5;            // 12 bytes, present if sealed
+  bytes prev_message_hash = 6;       // SHA-256 of previous message in sender's transcript chain
+  bytes referenced_message_id = 7;  // 32-byte computed ID of the target message (present for EDIT/DELETE)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Group State (persistence)
+// ─────────────────────────────────────────────────────────────────────────────
+
+message GroupProtocolState {
+  uint32 version = 1;
+  bytes group_id = 2;                 // 32 bytes
+  uint64 epoch = 3;
+  uint32 my_leaf_index = 4;
+  repeated GroupTreeNode tree_nodes = 5;
+  bytes epoch_secret = 6;            // 32 bytes
+  bytes init_secret = 7;             // 32 bytes
+  bytes metadata_key = 8;            // 32 bytes
+  bytes confirmation_key = 9;        // 32 bytes
+  bytes welcome_key = 10;            // 32 bytes
+
+  // Sender key chains for all members
+  repeated GroupMemberSenderChain sender_chains = 12;
+
+  // My identity
+  bytes my_identity_ed25519_public = 20;
+  bytes my_identity_x25519_public = 21;
+
+  // Group context
+  bytes group_context_hash = 22;
+
+  // Replay protection
+  repeated bytes seen_message_ids = 23;
+
+  // Anti-rollback HMAC
+  bytes state_hmac = 24;
+  uint64 state_counter = 25;
+
+  // Nonce counter
+  uint64 nonce_counter = 26;
+
+  google.protobuf.Timestamp created_at = 27;
+
+  // Shield Mode security policy (immutable after group creation)
+  bytes security_policy = 28;
+}
+
+message GroupMemberSenderChain {
+  uint32 leaf_index = 1;
+  bytes chain_key = 2;               // Current chain_key[n], 32 bytes
+  uint32 generation = 3;             // Current generation index
+}
+
+message SealedGroupState {
+  uint32 version = 1;
+  bytes dek_nonce = 2;               // 12 bytes
+  bytes state_nonce = 3;             // 12 bytes
+  bytes encrypted_dek = 4;           // AES-256-GCM-SIV(kek, dek)
+  bytes encrypted_state = 5;         // AES-256-GCM-SIV(dek, GroupProtocolState)
+  uint64 external_counter = 6;       // External anti-rollback counter (bound in AAD)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shield Mode: immutable security policy set at group creation
+// ─────────────────────────────────────────────────────────────────────────────
+
+message GroupSecurityPolicy {
+  uint32 max_messages_per_epoch = 1;      // 0 = use default (100,000)
+  uint32 max_skipped_keys_per_sender = 2; // 0 = use default (32)
+  bool block_external_join = 3;           // If true, from_external_join is rejected
+  bool enhanced_key_schedule = 4;         // Double-KDF + BLAKE2b chain hash
+  bool mandatory_franking = 5;            // All messages must include franking tag
+}

@@ -1,0 +1,185 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: Check & Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Install system dependencies (protobuf compiler for prost-build)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@21dc36fb71dd22e3317045c0c31a3f4249868b17 # stable
+        with:
+          toolchain: stable
+          components: clippy
+
+      - uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84 # v2.7.3
+
+      - name: cargo check
+        run: cargo check --all-targets
+
+      - name: cargo check (with ffi)
+        run: cargo check --all-targets --features ffi
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings -A unsafe_code
+
+      - name: cargo clippy (with ffi)
+        run: cargo clippy --all-targets --features ffi -- -D warnings -A unsafe_code
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Install protobuf compiler (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install protobuf compiler (macOS)
+        if: matrix.os == 'macos-latest'
+        run: brew install protobuf
+
+      - name: Install protobuf compiler (Windows)
+        if: matrix.os == 'windows-latest'
+        run: choco install protoc -y
+
+      - uses: dtolnay/rust-toolchain@21dc36fb71dd22e3317045c0c31a3f4249868b17 # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84 # v2.7.3
+
+      - name: cargo test
+        run: cargo test --release
+
+      - name: cargo test (with ffi)
+        run: cargo test --release --features ffi
+
+  formal:
+    name: Formal Verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Install Maude
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y maude
+
+      - name: Install Tamarin Prover (pre-built binary)
+        run: |
+          curl -fsSL https://github.com/tamarin-prover/tamarin-prover/releases/download/1.10.0/tamarin-prover-1.10.0-linux64-ubuntu.tar.gz \
+            -o /tmp/tamarin.tar.gz
+          tar xzf /tmp/tamarin.tar.gz -C /tmp
+          sudo install /tmp/tamarin-prover /usr/local/bin/
+          tamarin-prover --version
+
+      - name: Install ProVerif
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: 5
+
+      - name: Build ProVerif
+        run: |
+          opam install proverif -y
+          eval $(opam env)
+          echo "$(opam var bin)" >> $GITHUB_PATH
+
+      - name: Tamarin — Handshake model (6 lemmas)
+        run: make -C formal handshake
+
+      - name: Tamarin — Ratchet model (4 lemmas)
+        run: make -C formal ratchet
+
+      - name: ProVerif (6 queries)
+        run: make -C formal proverif
+
+  msrv:
+    name: MSRV (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@21dc36fb71dd22e3317045c0c31a3f4249868b17
+        with:
+          toolchain: "1.85"
+
+      - uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84 # v2.7.3
+
+      - name: cargo check (MSRV)
+        run: cargo check --all-targets
+
+  fuzz:
+    name: Fuzz Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@21dc36fb71dd22e3317045c0c31a3f4249868b17
+        with:
+          toolchain: nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+
+      - uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84 # v2.7.3
+
+      - name: Fuzz all targets (10s each)
+        run: |
+          cd fuzz
+          for target in $(cargo +nightly fuzz list 2>/dev/null); do
+            echo "::group::Fuzzing $target"
+            cargo +nightly fuzz run "$target" -- -max_total_time=10 -max_len=4096 || exit 1
+            echo "::endgroup::"
+          done
+
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - uses: dtolnay/rust-toolchain@21dc36fb71dd22e3317045c0c31a3f4249868b17 # stable
+        with:
+          toolchain: stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+
+      - name: Run cargo audit
+        run: cargo audit

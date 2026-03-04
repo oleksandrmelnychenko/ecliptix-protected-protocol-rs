@@ -1,0 +1,96 @@
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1'  # Mondays 06:00 UTC
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'benches/**'
+      - '.github/workflows/benchmarks.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: Benchmarks (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+            artifact: benchmark-linux
+            output: benchmark_linux.txt
+          - name: macOS
+            os: macos-14
+            artifact: benchmark-macos
+            output: benchmark_macos.txt
+          - name: Windows
+            os: windows-latest
+            artifact: benchmark-windows
+            output: benchmark_windows.txt
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install protobuf compiler (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install protobuf compiler (macOS)
+        if: matrix.os == 'macos-14'
+        run: brew install protobuf
+
+      - name: Install protobuf compiler (Windows)
+        if: matrix.os == 'windows-latest'
+        run: choco install protoc -y
+
+      - name: Run benchmarks
+        run: cargo bench 2>&1 | tee ${{ matrix.output }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.output }}
+
+  benchmark-report:
+    name: Benchmark report
+    needs: [bench]
+    runs-on: ubuntu-latest
+    if: always() && contains(needs.bench.result, 'success')
+    steps:
+      - name: Download all benchmark logs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: benchmark-*
+          path: bench-logs
+          merge-multiple: true
+
+      - name: Create combined report
+        run: |
+          echo "# Benchmark results — ${{ github.sha }} ($(date -u +%Y-%m-%dT%H:%MZ))" > benchmark_report.md
+          echo "" >> benchmark_report.md
+          for f in bench-logs/*.txt; do
+            [ -f "$f" ] || continue
+            name=$(basename "$f" .txt | sed 's/benchmark_//')
+            echo "## $name" >> benchmark_report.md
+            echo '```' >> benchmark_report.md
+            cat "$f" >> benchmark_report.md
+            echo '```' >> benchmark_report.md
+            echo "" >> benchmark_report.md
+          done
+          cat benchmark_report.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-report
+          path: benchmark_report.md

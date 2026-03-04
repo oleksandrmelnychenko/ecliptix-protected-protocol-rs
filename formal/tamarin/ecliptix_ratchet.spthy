@@ -1,0 +1,150 @@
+/*
+ * Ecliptix Protection Protocol — Ratchet-Only Tamarin Model
+ *
+ * Abstracts the handshake as trusted setup. Models a SINGLE hybrid ratchet
+ * step to verify post-compromise security (PCS) properties.
+ *
+ * DESIGN CHOICES:
+ *   - Terminal model: one ratchet step (no chaining).
+ *   - Compromise modeled at setup time (no state loops).
+ *   - DH ratchet abstracted as classical KEM (dh_pk/dh_encaps/dh_decaps).
+ *   - Kyber KEM modeled faithfully with encaps/decaps equation.
+ *   - Session ID (~sid) binds sender and receiver to the same session.
+ *   - SentCt fact models symmetric-chain integrity protection.
+ *
+ * Properties verified:
+ *   1. pcs_sender_compromise — new key secure despite sender compromise
+ *   2. ratchet_key_secrecy — new key secret absent ANY compromise
+ *   3. key_agreement — same-session parties derive same ratchet key
+ *   4. ratchet_exists — reachability / sanity check
+ *
+ * Reference: src/protocol/session.rs, docs/security-proof.tex Theorems 4-6
+ */
+
+theory EcliptixRatchet
+begin
+
+builtins: hashing
+
+functions:
+    dh_pk/1,
+    dh_encaps/2,
+    dh_decaps/2,
+    kyber_pk/1,
+    kyber_encaps/2,
+    kyber_decaps/2
+
+equations:
+    dh_decaps(dh_encaps(ss, dh_pk(sk)), sk) = ss,
+    kyber_decaps(kyber_encaps(ss, kyber_pk(sk)), sk) = ss
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §1  Session Setup — Compromise at Initialization
+// ═══════════════════════════════════════════════════════════════════════════════
+
+rule Setup_Honest:
+    let dh_pk_B = dh_pk(~dh_sk_B)
+        kpk_B   = kyber_pk(~ksk_B)
+    in
+    [ Fr(~rk), Fr(~sid), Fr(~dh_sk_B), Fr(~ksk_B) ]
+  --[ Setup($A, $B, ~sid) ]->
+    [ StA($A, $B, ~sid, ~rk, dh_pk_B, kpk_B),
+      StB($B, $A, ~sid, ~rk, ~dh_sk_B, ~ksk_B),
+      Out(dh_pk_B), Out(kpk_B) ]
+
+rule Setup_CompromiseSender:
+    let dh_pk_B = dh_pk(~dh_sk_B)
+        kpk_B   = kyber_pk(~ksk_B)
+    in
+    [ Fr(~rk), Fr(~sid), Fr(~dh_sk_B), Fr(~ksk_B) ]
+  --[ Setup($A, $B, ~sid), RevealSender($A, $B) ]->
+    [ StA($A, $B, ~sid, ~rk, dh_pk_B, kpk_B),
+      StB($B, $A, ~sid, ~rk, ~dh_sk_B, ~ksk_B),
+      Out(~rk),
+      Out(dh_pk_B), Out(kpk_B) ]
+
+rule Setup_CompromiseReceiver:
+    let dh_pk_B = dh_pk(~dh_sk_B)
+        kpk_B   = kyber_pk(~ksk_B)
+    in
+    [ Fr(~rk), Fr(~sid), Fr(~dh_sk_B), Fr(~ksk_B) ]
+  --[ Setup($A, $B, ~sid), RevealReceiver($B, $A) ]->
+    [ StA($A, $B, ~sid, ~rk, dh_pk_B, kpk_B),
+      StB($B, $A, ~sid, ~rk, ~dh_sk_B, ~ksk_B),
+      Out(~rk), Out(~dh_sk_B), Out(~ksk_B),
+      Out(dh_pk_B), Out(kpk_B) ]
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §2  Single Hybrid Ratchet Step
+// ═══════════════════════════════════════════════════════════════════════════════
+
+rule Sender_Ratchet:
+    let dh_ct = dh_encaps(~dh_ss, dh_pk_B)
+        kct   = kyber_encaps(~kss, kpk_B)
+        nrk   = h(<'ratchet', ~dh_ss, ~kss, rk>)
+    in
+    [ StA($A, $B, sid, rk, dh_pk_B, kpk_B),
+      Fr(~dh_ss), Fr(~kss) ]
+  --[ SenderRatchet($A, $B, sid, nrk) ]->
+    [ Out(<dh_ct, kct>),
+      SentCt(sid, dh_ct, kct) ]
+
+rule Receiver_Ratchet:
+    let dh_ss = dh_decaps(dh_ct, ~dh_sk_B)
+        kss   = kyber_decaps(kct, ~ksk_B)
+        nrk   = h(<'ratchet', dh_ss, kss, rk>)
+    in
+    [ StB($B, $A, sid, rk, ~dh_sk_B, ~ksk_B),
+      SentCt(sid, dh_ct, kct) ]
+  --[ ReceiverRatchet($B, $A, sid, nrk) ]->
+    [ ]
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §3  Security Lemmas
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/*
+ * LEMMA 1: PCS — Sender Compromise Resilience (Theorem 4)
+ *
+ * Even if the sender's state is compromised (adversary has root_key),
+ * the new ratchet key is secret unless the receiver is also compromised.
+ */
+lemma pcs_sender_compromise:
+    "All A B sid k #i.
+        SenderRatchet(A, B, sid, k) @i
+        ==> not(Ex #j. K(k) @j)
+            | (Ex #r. RevealReceiver(B, A) @r)"
+
+/*
+ * LEMMA 2: Ratchet Key Secrecy (Theorem 4)
+ */
+lemma ratchet_key_secrecy:
+    "All A B sid k #i.
+        SenderRatchet(A, B, sid, k) @i
+        ==> not(Ex #j. K(k) @j)
+            | (Ex #r. RevealSender(A, B) @r)
+            | (Ex #r. RevealReceiver(B, A) @r)"
+
+/*
+ * LEMMA 3: Key Agreement
+ *
+ * When both parties complete the ratchet in the same session
+ * (bound by session ID sid), they derive the same root key.
+ */
+lemma key_agreement:
+    "All A B sid k1 k2 #i #j.
+        SenderRatchet(A, B, sid, k1) @i
+        & ReceiverRatchet(B, A, sid, k2) @j
+        ==> k1 = k2"
+
+/*
+ * LEMMA 4: Ratchet Exists (Sanity / Reachability)
+ */
+lemma ratchet_exists:
+    exists-trace
+    "Ex A B sid k #i #j.
+        SenderRatchet(A, B, sid, k) @i
+        & ReceiverRatchet(B, A, sid, k) @j
+        & not(A = B)"
+
+end

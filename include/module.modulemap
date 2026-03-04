@@ -1,0 +1,5 @@
+framework module EcliptixProtocolC {
+  header "epp_api.h"
+  header "epp_export.h"
+  export *
+}

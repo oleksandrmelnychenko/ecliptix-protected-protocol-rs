@@ -1,0 +1,105 @@
+name: Build & Publish
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version override (e.g., 1.0.1)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build-apple-xcframework:
+    name: Build XCFramework
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protobuf compiler
+        run: brew install protobuf
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build Rust FFI for all Apple targets
+        run: |
+          cargo build --release --features ffi --target aarch64-apple-darwin
+          cargo build --release --features ffi --target aarch64-apple-ios
+          cargo build --release --features ffi --target aarch64-apple-ios-sim
+          cargo build --release --features ffi --target x86_64-apple-ios
+
+      - name: Create fat simulator library
+        run: |
+          lipo -create \
+            target/aarch64-apple-ios-sim/release/libecliptix_protected_protocol.a \
+            target/x86_64-apple-ios/release/libecliptix_protected_protocol.a \
+            -output target/libecliptix_protected_protocol_sim.a
+
+      - name: Create XCFramework
+        run: |
+          mkdir -p dist/apple
+          xcodebuild -create-xcframework \
+            -library target/aarch64-apple-darwin/release/libecliptix_protected_protocol.a \
+            -library target/aarch64-apple-ios/release/libecliptix_protected_protocol.a \
+            -library target/libecliptix_protected_protocol_sim.a \
+            -output dist/apple/EcliptixProtectedProtocol.xcframework
+          cd dist/apple && zip -r EcliptixProtectedProtocol.xcframework.zip EcliptixProtectedProtocol.xcframework
+          shasum -a 256 EcliptixProtectedProtocol.xcframework.zip > EcliptixProtectedProtocol.xcframework.zip.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apple-xcframework
+          path: dist/apple/
+          retention-days: 30
+
+  publish-release:
+    name: GitHub Release
+    needs: [build-apple-xcframework]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Determine version
+        id: version
+        run: |
+          VERSION="${{ github.ref_name }}"
+          echo "VERSION=${VERSION#v}" >> $GITHUB_OUTPUT
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/apple-xcframework/EcliptixProtectedProtocol.xcframework.zip
+            artifacts/apple-xcframework/EcliptixProtectedProtocol.xcframework.zip.sha256
+          body: |
+            ## Ecliptix Protected Protocol v${{ steps.version.outputs.VERSION }}
+
+            ### Swift Package Manager
+            ```swift
+            .binaryTarget(
+                name: "EcliptixProtectedProtocolBinary",
+                url: "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/EcliptixProtectedProtocol.xcframework.zip",
+                checksum: "$(cat artifacts/apple-xcframework/EcliptixProtectedProtocol.xcframework.zip.sha256 | cut -d' ' -f1)"
+            )
+            ```
+
+            ### Platforms
+            - macOS arm64
+            - iOS (arm64, simulator)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,105 @@
+syntax = "proto3";
+
+package ecliptix.proto.e2e;
+option csharp_namespace = "Ecliptix.Protobuf.E2E";
+option swift_prefix = "Ecliptix_Proto_E2E_";
+
+enum CryptoPayloadType {
+  CRYPTO_PAYLOAD_UNSPECIFIED = 0;
+  CRYPTO_PAYLOAD_GROUP_MESSAGE = 1;
+  CRYPTO_PAYLOAD_GROUP_COMMIT = 2;
+  CRYPTO_PAYLOAD_WELCOME = 3;
+  CRYPTO_PAYLOAD_KEY_PACKAGE = 4;
+  CRYPTO_PAYLOAD_PREKEY_BUNDLE = 5;
+}
+
+message CryptoEnvelope {
+  bytes sender_device_id = 1;
+  bytes recipient_device_id = 2;
+  CryptoPayloadType payload_type = 3;
+  bytes encrypted_payload = 4;
+  bytes group_id = 5;
+  uint64 epoch = 6;
+  uint64 generation = 7;
+  uint32 sender_leaf_index = 8;
+}
+
+message GroupCommitEnvelope {
+  bytes group_id = 1;
+  uint64 new_epoch = 2;
+  bytes commit_bytes = 3;
+  bytes welcome_bytes = 4;
+  bytes committer_device_id = 5;
+}
+
+message WelcomeEnvelope {
+  bytes group_id = 1;
+  bytes welcome_bytes = 2;
+  bytes sender_device_id = 3;
+  repeated bytes initial_key_packages = 4;
+}
+
+message FetchPendingEventsRequest {
+  bytes device_id = 1;
+  string last_event_id = 2;
+  uint32 max_events = 3;
+}
+
+message FetchPendingEventsResponse {
+  repeated PendingEvent events = 1;
+  string next_cursor = 2;
+  bool has_more = 3;
+}
+
+message PendingEvent {
+  string event_id = 1;
+  uint64 server_timestamp = 2;
+  CryptoEnvelope envelope = 3;
+}
+
+message AckEventsRequest {
+  bytes device_id = 1;
+  repeated string event_ids = 2;
+}
+
+message KeyPackageUpload {
+  bytes device_id = 1;
+  repeated bytes key_packages = 2;
+}
+
+message KeyPackageFetchRequest {
+  bytes target_device_id = 1;
+}
+
+message KeyPackageFetchResponse {
+  bytes key_package = 1;
+}
+
+message PreKeyBundleUpload {
+  bytes device_id = 1;
+  bytes prekey_bundle = 2;
+}
+
+message PreKeyBundleFetchRequest {
+  bytes target_device_id = 1;
+}
+
+message PreKeyBundleFetchResponse {
+  bytes prekey_bundle = 1;
+}
+
+message DeviceLinkInitRequest {
+  bytes primary_device_id = 1;
+  bytes provisioning_public_key = 2;
+}
+
+message DeviceLinkCompleteRequest {
+  bytes primary_device_id = 1;
+  bytes new_device_id = 2;
+  bytes encrypted_identity = 3;
+  repeated bytes encrypted_welcomes = 4;
+}
+
+message DeviceLinkCompleteResponse {
+  bool is_success = 1;
+}

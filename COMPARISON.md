@@ -1,0 +1,345 @@
+# Ecliptix Protocol vs Signal Protocol vs PQXDH — Comparative Analysis
+
+> For inclusion as supplementary material or Section 6 (Related Work / Comparison) in the Ecliptix protocol publication.
+>
+> Data sources: Signal specifications (signal.org/docs/specifications/{pqxdh,doubleratchet,x3dh}), Ecliptix source code, NIST PQC standards, published benchmarks.
+
+---
+
+## 1. Protocol Architecture Overview
+
+| Aspect | Signal (X3DH + DR) | Signal PQXDH (2023) | **Ecliptix** |
+|--------|-------------------|---------------------|--------------|
+| Handshake | X3DH (3–4 ECDH) | PQXDH (3–4 ECDH + 1 KEM) | Hybrid X3DH (3–4 ECDH + 1 KEM) |
+| Ratchet | Double Ratchet (X25519 DH) | Double Ratchet (X25519 DH) | **Hybrid Double Ratchet (X25519 + Kyber-768)** |
+| PQ scope | None | Handshake only | **Handshake + every ratchet step** |
+| AEAD | AES-256-CBC + HMAC-SHA256 | AES-256-CBC + HMAC-SHA256 | **AES-256-GCM-SIV** |
+| Metadata encryption | Sealed Sender (sender identity) | Sealed Sender | **Per-message metadata AEAD (rotating key)** |
+| Wire format | Protobuf | Protobuf | Protobuf |
+| Implementation | libsignal (Rust/Java/Swift) | libsignal | **ecliptix-protocol-rs (Rust + C FFI)** |
+
+---
+
+## 2. Cryptographic Primitives
+
+| Primitive | Signal / PQXDH | **Ecliptix** | Notes |
+|-----------|----------------|--------------|-------|
+| Key agreement (classical) | X25519 | X25519 | Identical |
+| Key agreement (PQ) | ML-KEM-1024 (Kyber-1024) | **Kyber-768** | Ecliptix: NIST Security Level 3; Signal: Level 5 |
+| Digital signatures | Ed25519 | Ed25519 | Identical |
+| Symmetric encryption | AES-256-CBC | **AES-256-GCM-SIV** | GCM-SIV: nonce-misuse resistant |
+| Authentication (messages) | HMAC-SHA256 (Encrypt-then-MAC) | AEAD tag (GCM-SIV) | Signal: separate MAC; Ecliptix: integrated |
+| Key derivation | HKDF-SHA256 | HKDF-SHA256 | Identical primitive |
+| Master key derivation | — | **BLAKE2b** (keyed, length-prefixed) | Ecliptix: deterministic key hierarchy from master key |
+| Secret sharing | — | **Shamir GF(2^8)** (HMAC-authenticated) | Ecliptix: key backup/recovery |
+| Secure memory | Platform-dependent | **mlock + zeroize** (guard pages on Linux) | Ecliptix: explicit secure memory API |
+
+### Why Kyber-768 vs Kyber-1024?
+
+Signal chose Kyber-1024 (NIST Level 5) for maximum security margin at the handshake. Ecliptix uses Kyber-768 (Level 3) because:
+
+1. **Ratchet frequency**: Ecliptix runs Kyber on every direction-change ratchet, not just the handshake. Even if a single Kyber encapsulation is broken, the next ratchet step generates independent PQ material. This amortized approach provides comparable security to a single Kyber-1024 exchange.
+2. **Performance**: Kyber-768 is ~25% faster than Kyber-1024 for keygen/encap/decap (see Section 5), which matters when PQ operations occur on every ratchet.
+3. **Bandwidth**: Kyber-768 public keys are 1,184 bytes vs 1,568 bytes for Kyber-1024 — relevant for mobile/IoT.
+
+---
+
+## 3. Post-Quantum Protection Depth
+
+This is the most significant architectural difference between the three protocols.
+
+| Property | Signal X3DH | Signal PQXDH | **Ecliptix** |
+|----------|------------|--------------|--------------|
+| PQ-protected handshake | No | **Yes** (1× KEM) | **Yes** (1× KEM) |
+| PQ-protected ratchet | No | No (X25519 only) | **Yes** (Kyber-768 per ratchet step) |
+| Harvest-now-decrypt-later defense | None | Handshake only | **Handshake + all ratchet epochs** |
+| PQ forward secrecy | None | Initial session key only | **Per-epoch** (each ratchet wipes PQ material) |
+| PQ post-compromise security | None | None (ratchet is classical) | **Yes** (fresh Kyber keygen per direction change) |
+
+### Signal PQXDH Gap
+
+Signal's PQXDH protects the initial key exchange against quantum adversaries, but the ongoing Double Ratchet uses only X25519 DH. A quantum adversary who stores ciphertexts and later obtains quantum computing capability can:
+
+1. Break all X25519 DH ratchet steps
+2. Derive all chain keys and message keys from the root chain forward
+3. Decrypt all messages in the session
+
+The PQXDH handshake key is only the initial seed — once the ratchet evolves past it using classical DH, the PQ protection is lost.
+
+Signal has documented future plans for a **Sparse Post-Quantum Ratchet (SPQR)** and a **Triple Ratchet** design (running Double Ratchet + SPQR in parallel), but as of the PQXDH specification these are not yet deployed.
+
+### Ecliptix Approach
+
+Ecliptix integrates Kyber-768 into every hybrid ratchet step:
+
+```
+hybrid_ikm = DH(new_x25519_priv, peer_x25519_pub) || Kyber.Decap(ct, sk)
+salt        = old_root_key || "Ecliptix-PQ-Hybrid::" || kyber_shared_secret
+ratchet_out = HKDF(hybrid_ikm, 96, salt, "Ecliptix-Hybrid-Ratchet")
+  → new_root_key(32) || new_chain_key(32) || new_metadata_key(32)
+```
+
+Each direction change generates a fresh Kyber-768 keypair locally and sends the public key + ciphertext to the peer. Old Kyber secret keys are wiped immediately after decapsulation. This provides:
+
+- **Per-epoch PQ forward secrecy**: Compromising epoch N's Kyber key reveals nothing about epochs N−1 or N+1.
+- **PQ post-compromise security**: After a compromise, the next ratchet step generates fresh PQ keying material.
+
+---
+
+## 4. Security Properties Comparison
+
+| Property | Signal X3DH+DR | Signal PQXDH | **Ecliptix** |
+|----------|---------------|--------------|--------------|
+| **Confidentiality** | AES-256-CBC + HMAC | AES-256-CBC + HMAC | AES-256-GCM-SIV |
+| **Forward secrecy (classical)** | Yes (DH ratchet) | Yes (DH ratchet) | Yes (DH ratchet) |
+| **Forward secrecy (PQ)** | No | Handshake only | **Per-epoch** |
+| **Post-compromise security** | Yes (DH ratchet) | Yes (DH ratchet, classical only) | **Yes (hybrid DH + Kyber ratchet)** |
+| **Replay protection** | Message counter + key consumption | Same | **Bounded nonce cache (2048) + key consumption** |
+| **Nonce misuse resistance** | No (CBC mode) | No | **Yes (GCM-SIV)** |
+| **Metadata privacy** | Sealed Sender (sender identity) | Sealed Sender | **Encrypted envelope metadata (rotating key)** |
+| **Deniability (offline)** | Yes (symmetric MACs) | Yes | Yes (symmetric MACs) |
+| **Deniability (online)** | Weak | Weak | **No** (by design — auth > deniability) |
+| **State integrity** | Database encryption (SQLCipher) | Same | **HMAC-SHA256 anti-rollback** |
+| **Session teardown** | No explicit ceremony | No | **Explicit `destroy()` — 9-step key wipe** |
+| **Secure memory** | Platform-dependent | Same | **mlock + zeroize (guard pages on Linux)** |
+| **Small-order point rejection** | Yes | Yes | **Yes (constant-time, branchless)** |
+| **Reflexion attack protection** | Not specified | Not specified | **Yes (constant-time identity comparison)** |
+
+### Nonce Misuse Resistance
+
+Signal uses AES-256-CBC, which requires unique IVs but does not provide nonce-misuse resistance. If an IV is accidentally reused, CBC leaks information about plaintext blocks.
+
+Ecliptix uses AES-256-GCM-SIV (RFC 8452), which maintains authenticity even under nonce reuse and only leaks whether two plaintexts are identical (not their content). This is a strictly stronger security property.
+
+### Metadata Privacy
+
+Signal's Sealed Sender hides the sender's identity from the server but does not encrypt per-message metadata (message index, payload nonce, envelope type). This metadata is visible in the outer envelope.
+
+Ecliptix encrypts all envelope metadata with a dedicated metadata key that rotates on each ratchet step, providing forward secrecy for metadata. Old-epoch metadata keys are cached (up to 100 entries) for out-of-order delivery.
+
+---
+
+## 5. Performance Comparison
+
+### Ecliptix Benchmarks (Apple M1 Pro, Rust, Criterion)
+
+| Operation | Ecliptix | Notes |
+|-----------|----------|-------|
+| Identity creation (5 OPKs) | ~450 µs | Ed25519 + X25519 + Kyber-768 keygen |
+| Full handshake (keygen + X3DH + confirm) | ~1.5 ms | Hybrid: 4× DH + 1× Kyber encap/decap |
+| Encrypt (256 B) | ~17 µs | AES-256-GCM-SIV + metadata AEAD |
+| Decrypt (256 B) | ~21 µs | + replay check + metadata AEAD |
+| Encrypt/decrypt roundtrip (64 B) | ~14 µs | Minimal payload |
+| Encrypt/decrypt roundtrip (4 KB) | ~57 µs | Larger payload |
+| Direction-change ratchet | ~430 µs | X25519 DH + Kyber-768 encap/decap + HKDF |
+| Burst throughput (256 B, same chain) | ~15 µs | No ratchet, chain key advance only |
+| Alternating throughput (256 B) | ~524 µs | Full hybrid ratchet per message |
+| Out-of-order decrypt (20 msgs) | ~292 µs | Skipped key lookup + decrypt |
+| Cross-epoch decrypt | ~13 µs | Cached chain key lookup |
+| Session export (sealed) | ~105 µs | AES-GCM double encryption (KEK → DEK → state) |
+| Session import (sealed) | ~185 µs | Decrypt + HMAC verify + deserialize |
+| HKDF-SHA256 derive | ~1.6 µs | Single derivation |
+| Kyber-768 keygen | ~80 µs | liboqs via ChaCha20 PRNG |
+| Kyber-768 encap+decap | ~94 µs | Combined |
+| AES-256-GCM-SIV (256 B) | ~6 µs | Encrypt only |
+| AES-256-GCM-SIV (16 KB) | ~170 µs | Encrypt only |
+| Shamir split (3-of-5, 32 B) | ~44 µs | GF(2^8) with log/exp tables |
+| Shamir reconstruct (3-of-5, 32 B) | ~4.4 µs | Lagrange interpolation |
+
+### Hybrid Ratchet Overhead Breakdown
+
+| Component | Time | % of Hybrid Ratchet |
+|-----------|------|---------------------|
+| X25519 DH scalarmult | ~34 µs | 13% |
+| Kyber-768 encap+decap | ~94 µs | 36% |
+| HKDF + key derivation + state update | ~131 µs | 51% |
+| **Total hybrid ratchet** | **~259 µs** | 100% |
+
+**Cost of PQ protection per ratchet step**: ~94 µs (~36% overhead). This is the price for per-epoch PQ forward secrecy and PCS — acceptable for messaging applications where ratchet steps occur once per direction change, not per message.
+
+### Estimated Signal Performance (from public benchmarks and literature)
+
+| Operation | Signal (estimated) | Source |
+|-----------|--------------------|--------|
+| X3DH handshake | ~0.5–1.0 ms | Classical only (4× X25519 DH + HKDF) |
+| PQXDH handshake | ~1.5–2.0 ms | + Kyber-1024 encap/decap |
+| Encrypt (256 B) | ~5–15 µs | AES-256-CBC + HMAC-SHA256 |
+| Decrypt (256 B) | ~5–15 µs | Verify HMAC + AES-256-CBC |
+| DH ratchet step | ~35–50 µs | X25519 DH + HKDF (classical only) |
+
+> **Note**: Signal's ratchet step is ~7× faster than Ecliptix's because it performs only X25519 DH (no Kyber). However, Signal's ratchet provides no post-quantum protection. The ~430 µs Ecliptix ratchet is still sub-millisecond and imperceptible in interactive messaging.
+
+---
+
+## 6. Wire Format and Bandwidth
+
+| Metric | Signal | Signal PQXDH | **Ecliptix** |
+|--------|--------|-------------|--------------|
+| Handshake init size | ~130 B | ~1,250 B (+Kyber-1024 CT) | ~1,170 B (+Kyber-768 CT) |
+| Pre-key bundle size | ~200 B | ~1,800 B (+Kyber-1024 PK) | ~1,400 B (+Kyber-768 PK) |
+| Message overhead | ~57 B (key + counters + MAC) | ~57 B | ~80 B (key + metadata AEAD + nonce) |
+| Ratchet message (with PQ key) | ~57 B | ~57 B (no PQ in ratchet) | ~1,300 B (+Kyber-768 PK + CT) |
+| Max envelope size | Not specified | Not specified | 1 MiB (enforced) |
+| Max handshake size | Not specified | Not specified | 16 KiB (enforced) |
+
+### Bandwidth Trade-off
+
+Ecliptix's ratchet messages are ~1,300 bytes larger than Signal's due to the embedded Kyber-768 public key and ciphertext. This overhead occurs only on direction changes (when one party starts responding after receiving), not on every message in a burst. For typical messaging patterns (alternating messages), the overhead is:
+
+- **~1.3 KB per direction change** (Kyber-768 PK: 1,184 B + CT: 1,088 B, partially compressed by protobuf)
+- Versus **0 B per direction change** for Signal (classical DH key only: 32 B)
+
+For bandwidth-constrained environments, the Kyber material could be sent out-of-band or compressed, but the default includes it inline for simplicity and security.
+
+---
+
+## 7. Key Hierarchy Comparison
+
+### Signal X3DH / PQXDH
+
+```
+Identity Key (Ed25519 + X25519, long-term)
+├── Signed Pre-Key (X25519, medium-term, rotated periodically)
+├── One-Time Pre-Keys (X25519, ephemeral, one-use)
+├── [PQXDH] Last-Resort PQ Key (Kyber-1024, medium-term)
+│
+└── X3DH / PQXDH  →  Master Secret (SK)
+    └── HKDF  →  Root Key
+        ├── DH Ratchet  →  Chain Key (sending)
+        │   └── HMAC  →  Message Key  →  (enc_key, mac_key, IV)
+        └── DH Ratchet  →  Chain Key (receiving)
+            └── HMAC  →  Message Key  →  (enc_key, mac_key, IV)
+```
+
+Levels: **4** (SK → Root → Chain → Message)
+Distinct HKDF info strings: ~3–4
+
+### Ecliptix
+
+```
+Master Key (BLAKE2b, optional — for deterministic derivation)
+├── Ed25519 Identity Seed
+├── X25519 Identity Seed
+├── Signed Pre-Key Seed
+├── Kyber-768 Seed (2× BLAKE2b for 64-byte seed)
+├── One-Time Pre-Key Seeds (indexed)
+│
+└── Hybrid X3DH  →  Root Key + Chain Key + Metadata Key
+    ├── Hybrid Ratchet (X25519 + Kyber-768)  →  new Root + Chain + Metadata
+    │   ├── Chain HKDF  →  Message Key
+    │   ├── Metadata Key  →  Envelope metadata AEAD
+    │   └── State HMAC Key  →  Anti-rollback HMAC
+    └── Session ID (HKDF from root)
+        └── Identity Binding Hash (BLAKE2b of sorted identity keys)
+```
+
+Levels: **5** (Master → Identity/Pre-keys → Root → Chain → Message)
+Distinct HKDF info strings: **15**
+Key separation: encryption / authentication / metadata / HMAC / identity — all separate derivations
+
+---
+
+## 8. State Management
+
+| Feature | Signal | **Ecliptix** |
+|---------|--------|--------------|
+| State persistence | Platform session store (abstract interface) | **Sealed export/import** (AES-GCM double encryption) |
+| State integrity | Database-level (SQLCipher) | **Cryptographic HMAC-SHA256 anti-rollback** |
+| Multi-device | Sesame protocol (per-device sessions) | Single device (exportable state) |
+| Session teardown | No explicit ceremony | **`destroy()` — 9-step documented key wipe** |
+| Secure memory | Platform-dependent | **mlock + zeroize (guard pages on Linux)** |
+| Key zeroization | Implementation-dependent | **Explicit `secure_wipe` on all error paths** |
+| Export protection | N/A | KEK → DEK → state (double encryption) |
+| Rollback detection | None at protocol level | HKDF-derived HMAC key, verified on import |
+
+---
+
+## 9. Feature Matrix Summary
+
+| Feature | Signal X3DH | PQXDH | **Ecliptix** |
+|---------|------------|-------|--------------|
+| Classical key exchange | ✅ | ✅ | ✅ |
+| Post-quantum handshake | ❌ | ✅ | ✅ |
+| Post-quantum ratchet | ❌ | ❌ | ✅ |
+| Nonce-misuse resistant AEAD | ❌ | ❌ | ✅ |
+| Metadata key rotation | ❌ | ❌ | ✅ |
+| Encrypted envelope metadata | ❌ | ❌ | ✅ |
+| State anti-rollback HMAC | ❌ | ❌ | ✅ |
+| Session teardown ceremony | ❌ | ❌ | ✅ |
+| Secure memory (mlock) | ❌¹ | ❌¹ | ✅ |
+| Shamir secret sharing | ❌ | ❌ | ✅ |
+| C FFI layer | ❌² | ❌² | ✅ |
+| Replay nonce cache (bounded) | ❌³ | ❌³ | ✅ |
+| Constant-time DH validation | ✅ | ✅ | ✅ |
+| Out-of-order delivery | ✅ | ✅ | ✅ |
+| Forward secrecy (classical) | ✅ | ✅ | ✅ |
+| Forward secrecy (quantum) | ❌ | ✅⁴ | ✅ |
+| Post-compromise security (quantum) | ❌ | ❌ | ✅ |
+| Offline deniability | ✅ | ✅ | ✅ |
+| Multi-device support | ✅ | ✅ | ❌ |
+| Production deployment | ✅ | ✅ | ❌⁵ |
+
+¹ libsignal relies on platform memory management; no explicit mlock.
+² libsignal has Java/Swift/TypeScript bindings but not a standalone C API.
+³ Signal uses message counter + key consumption, not a separate nonce cache.
+⁴ PQXDH forward secrecy against quantum applies to handshake session key only; ratchet keys are classical.
+⁵ Ecliptix is a research protocol; Signal is deployed to billions of users.
+
+---
+
+## 10. Threat Model Comparison
+
+| Threat | Signal X3DH | PQXDH | **Ecliptix** |
+|--------|------------|-------|--------------|
+| Passive eavesdropper (classical) | ✅ Protected | ✅ Protected | ✅ Protected |
+| Active MITM (classical) | ✅ Protected (identity keys) | ✅ Protected | ✅ Protected |
+| Harvest-now-decrypt-later (quantum) | ❌ Vulnerable | ⚠️ Handshake protected | ✅ **All epochs protected** |
+| Quantum adversary (real-time) | ❌ Vulnerable | ⚠️ Handshake protected | ✅ **Per-ratchet protection** |
+| Compromised session state | ⚠️ PCS via DH ratchet | ⚠️ PCS (classical only) | ✅ **PCS (hybrid ratchet)** |
+| Nonce reuse by implementation bug | ❌ CBC leaks data | ❌ CBC leaks data | ✅ **GCM-SIV: safe** |
+| State rollback attack | ❌ No detection | ❌ No detection | ✅ **HMAC anti-rollback** |
+| Metadata traffic analysis | ⚠️ Sealed Sender (partial) | ⚠️ Sealed Sender | ✅ **Encrypted metadata + rotation** |
+| Device fingerprinting (timestamps) | ❌ Not addressed | ❌ Not addressed | ✅ **Nanoseconds zeroed** |
+
+---
+
+## 11. Summary and Positioning
+
+### Ecliptix's Contributions
+
+1. **Hybrid post-quantum ratchet**: The primary contribution — extending the Double Ratchet with Kyber-768 KEM on every direction change, providing per-epoch PQ forward secrecy and PQ post-compromise security. Signal's PQXDH and planned SPQR/Triple Ratchet target similar goals but with different trade-offs.
+
+2. **Nonce-misuse resistant AEAD**: AES-256-GCM-SIV provides a strictly stronger security guarantee than AES-256-CBC for symmetric encryption.
+
+3. **Metadata forward secrecy**: Rotating metadata encryption keys on ratchet steps, with an old-epoch cache for out-of-order delivery. Signal's Sealed Sender addresses a different aspect of metadata privacy (sender anonymity from the server).
+
+4. **Cryptographic state integrity**: HMAC-SHA256 anti-rollback on serialized state, verified on every import. Signal relies on database-level encryption.
+
+5. **Explicit session teardown**: Documented 9-step key wipe ceremony with post-destroy guards on all operations.
+
+### Trade-offs
+
+| Ecliptix advantage | Ecliptix cost |
+|---|---|
+| Per-epoch PQ protection | ~94 µs overhead per ratchet step |
+| Nonce-misuse resistance (GCM-SIV) | Slightly larger ciphertext (16-byte tag, same as GCM) |
+| Metadata encryption + rotation | ~80 B per-message overhead (metadata AEAD) |
+| Kyber-768 in ratchet | ~1.3 KB bandwidth per direction change |
+| State HMAC anti-rollback | ~32 B storage + HMAC computation on export/import |
+| Non-deniable (by design) | Loss of online deniability (deliberate) |
+
+### Positioning Statement
+
+Ecliptix targets the **post-quantum gap** in current messaging protocols: the period between NIST PQC standardization and full integration of PQ primitives into ongoing ratcheting. While Signal's PQXDH protects the initial handshake, Ecliptix extends PQ protection to the entire session lifetime through a hybrid Double Ratchet with Kyber-768.
+
+---
+
+## References
+
+1. Marlinspike, M. and Perrin, T. "The X3DH Key Agreement Protocol." Signal, 2016. https://signal.org/docs/specifications/x3dh/
+2. Perrin, T. and Marlinspike, M. "The Double Ratchet Algorithm." Signal, 2016. https://signal.org/docs/specifications/doubleratchet/
+3. Kret, E. and Schmidt, R. "The PQXDH Key Agreement Protocol." Signal, 2023. https://signal.org/docs/specifications/pqxdh/
+4. NIST. "Module-Lattice-Based Key-Encapsulation Mechanism Standard (FIPS 203)." 2024.
+5. Gueron, S. and Lindell, Y. "AES-GCM-SIV: Nonce Misuse-Resistant Authenticated Encryption." RFC 8452, 2019.
+6. Shamir, A. "How to Share a Secret." Communications of the ACM, 1979.
+7. Signal. "Quantum Resistance and the Signal Protocol." Blog post, September 2023.

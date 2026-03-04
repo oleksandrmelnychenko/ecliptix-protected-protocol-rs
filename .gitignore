@@ -1,0 +1,36 @@
+/target
+**/*.rs.bk
+*.pdb
+*.dSYM/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Swift build artifacts
+swift/.build/
+swift/XCFrameworks/
+
+# Generated PDFs (rebuild with pdflatex)
+docs/*.pdf
+
+# Tamarin/ProVerif output
+formal/tamarin/output/
+formal/proverif/output/
+formal/tamarin/*.tmp
+formal/proverif/*.tmp
+
+# Criterion benchmark output
+target/criterion/
+
+# Secrets / credentials — never commit
+.env*
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+fuzz/target
+.claude/

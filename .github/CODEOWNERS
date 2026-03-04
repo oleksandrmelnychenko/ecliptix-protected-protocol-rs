@@ -1,0 +1,21 @@
+# CODEOWNERS - Define code ownership for review requirements
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default owners for everything in the repo
+* @oleksandrmelnychenko
+
+# Cryptographic core
+/src/ @oleksandrmelnychenko
+
+# Security documentation
+/SECURITY.md @oleksandrmelnychenko
+/docs/ @oleksandrmelnychenko
+
+# Build and release configuration
+/.github/workflows/ @oleksandrmelnychenko
+
+# Swift bindings
+/swift/ @oleksandrmelnychenko
+
+# Formal verification
+/formal/ @oleksandrmelnychenko

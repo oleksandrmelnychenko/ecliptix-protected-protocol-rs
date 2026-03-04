@@ -1,0 +1,132 @@
+[package]
+name = "ecliptix-protocol"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Ecliptix Signal Protocol-like double ratchet with X3DH and post-quantum hybrid encryption"
+license = "MIT"
+
+[lib]
+name = "ecliptix_protocol"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = []
+# Enable C FFI layer + staticlib/cdylib outputs (for Swift, .NET, C++ clients).
+# Server (Rust) does not need this — use the crate directly via `api` module.
+ffi = []
+# Skip mlock for SecureMemoryHandle (uses plain heap + zeroize only).
+# ** Do NOT enable in production — disables mlock memory pinning. **
+no-secure-memory = []
+
+[dependencies]
+# AES-256-GCM-SIV (nonce-misuse resistant)
+aes-gcm-siv = { version = "0.11", features = ["std"] }
+# HKDF-SHA256
+hkdf = "0.12"
+sha2 = "0.10"
+# HMAC-SHA256
+hmac = "0.12"
+# X25519 Diffie-Hellman
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+# Ed25519 signatures
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+# ML-KEM-768 (FIPS 203, post-quantum KEM)
+ml-kem = "0.2"
+# Constant-time operations
+subtle = "2"
+# BLAKE2b keyed hash
+blake2 = "0.10"
+# CSPRNG
+rand_core = { version = "0.6", features = ["getrandom"] }
+rand_chacha = "0.3"
+# Secure memory (mlock/munlock)
+libc = "0.2"
+# Protobuf (prost)
+prost = "0.14"
+prost-types = "0.14"
+# Secure zeroing
+zeroize = { version = "1.8", features = ["derive", "alloc"] }
+# Error handling
+thiserror = "2"
+
+[build-dependencies]
+prost-build = "0.14"
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+proptest = "1.10"
+
+[[bench]]
+name = "protocol_bench"
+harness = false
+
+# ═══════════════════════════════════════════════════
+# Lint configuration
+# ═══════════════════════════════════════════════════
+
+[lints.rust]
+# unsafe is expected in FFI and SecureMemoryHandle — warn to ensure SAFETY comments
+unsafe_code = "warn"
+
+[lints.clippy]
+# ── DENY — hard errors, never allow ──
+correctness = { level = "deny", priority = -1 }
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+# ── WARN — should fix but review case-by-case ──
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+redundant_closure = "warn"
+cloned_instead_of_copied = "warn"
+implicit_clone = "warn"
+
+# Casting safety (critical for crypto — truncation bugs cause vulnerabilities)
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+cast_possible_wrap = "warn"
+cast_lossless = "warn"
+
+# ── ALLOW — explicitly permitted with reason ──
+# Too noisy for this project:
+module_name_repetitions = "allow"       # protocol::ProtocolError is fine
+must_use_candidate = "allow"            # Too many false positives
+missing_errors_doc = "allow"            # Will add docs in separate pass
+missing_panics_doc = "allow"            # Will add docs in separate pass
+missing_docs_in_private_items = "allow"
+too_many_lines = "allow"                # Crypto functions are inherently long
+cognitive_complexity = "allow"          # Crypto functions are inherently complex
+similar_names = "allow"                 # sk/pk, ct/ss naming is intentional in crypto
+wildcard_imports = "allow"              # Used for constants module
+items_after_statements = "allow"        # Used for `use` imports in function scope
+significant_drop_tightening = "allow"   # False positives with zeroize-on-drop types
+as_ptr_cast_mut = "allow"              # Required for FFI raw pointer casts
+use_self = "allow"                      # Self vs TypeName is stylistic
+doc_markdown = "allow"                  # Most from generated protobuf code
+needless_pass_by_value = "allow"        # Many intentional moves for crypto wiping
+
+[profile.release]
+opt-level = 2                # NOT 3 — aggressive opt can break constant-time crypto
+lto = "fat"                  # Full LTO — better dead code elimination, smaller binary
+codegen-units = 1            # Single codegen unit — better optimization, deterministic builds
+panic = "abort"              # No unwinding — smaller binary, reduced attack surface
+strip = "symbols"            # Strip debug symbols in release
+overflow-checks = true       # CRITICAL: keep integer overflow checks in release
+debug = false                # No debug info in release
+incremental = false          # Reproducible release builds
+
+[profile.release.build-override]
+opt-level = 2
+
+[profile.dev]
+overflow-checks = true
+debug = true
+
+[profile.test]
+overflow-checks = true
+
+[profile.bench]
+lto = "fat"
+codegen-units = 1

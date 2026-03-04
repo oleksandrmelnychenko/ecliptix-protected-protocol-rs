@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package ecliptix.proto.protocol;
+option csharp_namespace = "Ecliptix.Protobuf.Protocol";
+
+message SealedState {
+  uint32 version = 1;
+  bytes dek_nonce = 2;
+  bytes state_nonce = 3;
+  bytes encrypted_dek = 4;
+  bytes encrypted_state = 5;
+  uint64 external_counter = 6;
+}

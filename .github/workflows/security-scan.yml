@@ -1,0 +1,109 @@
+name: Security Scanning
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cargo-audit:
+    name: Cargo Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Run cargo audit
+        run: cargo audit
+
+  cargo-deny:
+    name: Cargo Deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          command-arguments: --hide-inclusion-graph
+        continue-on-error: true
+
+  secret-scan:
+    name: Secret Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: trufflesecurity/trufflehog@v3.88.16
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          extra_args: --only-verified
+
+  license-check:
+    name: License Compliance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for LICENSE file
+        run: |
+          if [ ! -f LICENSE ]; then
+            echo "ERROR: LICENSE file not found"
+            exit 1
+          fi
+          echo "LICENSE file found"
+          head -5 LICENSE
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check Rust dependency licenses
+        run: |
+          echo "=== Checking Rust dependency license metadata ==="
+
+          cargo metadata --format-version 1 --no-deps \
+            | python3 -c "
+          import json, sys
+          meta = json.load(sys.stdin)
+          for pkg in meta['packages']:
+              name = pkg['name']
+              license = pkg.get('license', 'UNKNOWN')
+              print(f'  {name}: {license}')
+          "
+
+          echo ""
+          echo "=== Checking all workspace dependency licenses ==="
+
+          cargo metadata --format-version 1 \
+            | python3 -c "
+          import json, sys
+          meta = json.load(sys.stdin)
+
+          denied = ['GPL-3.0-only', 'GPL-3.0-or-later', 'AGPL-3.0-only', 'AGPL-3.0-or-later']
+          errors = 0
+
+          for pkg in meta['packages']:
+              name = pkg['name']
+              license = pkg.get('license', 'UNKNOWN')
+              for d in denied:
+                  if license and d in license:
+                      print(f'ERROR: {name} uses denied license: {license}')
+                      errors += 1
+
+          if errors > 0:
+              print(f'\n{errors} dependency(ies) with denied licenses found.')
+              sys.exit(1)
+          else:
+              print('All dependency licenses are compatible.')
+          "
