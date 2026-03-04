@@ -32,25 +32,24 @@ jobs:
 
       - name: Build Rust FFI for all Apple targets
         run: |
-          cargo build --release --features ffi --target aarch64-apple-darwin
-          cargo build --release --features ffi --target aarch64-apple-ios
-          cargo build --release --features ffi --target aarch64-apple-ios-sim
-          cargo build --release --features ffi --target x86_64-apple-ios
+          for target in aarch64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios; do
+            cargo rustc --release --features ffi --target "$target" --crate-type staticlib
+          done
 
       - name: Create fat simulator library
         run: |
           lipo -create \
-            target/aarch64-apple-ios-sim/release/libecliptix_protected_protocol.a \
-            target/x86_64-apple-ios/release/libecliptix_protected_protocol.a \
-            -output target/libecliptix_protected_protocol_sim.a
+            target/aarch64-apple-ios-sim/release/libecliptix_protocol.a \
+            target/x86_64-apple-ios/release/libecliptix_protocol.a \
+            -output target/libecliptix_protocol_sim.a
 
       - name: Create XCFramework
         run: |
           mkdir -p dist/apple
           xcodebuild -create-xcframework \
-            -library target/aarch64-apple-darwin/release/libecliptix_protected_protocol.a \
-            -library target/aarch64-apple-ios/release/libecliptix_protected_protocol.a \
-            -library target/libecliptix_protected_protocol_sim.a \
+            -library target/aarch64-apple-darwin/release/libecliptix_protocol.a \
+            -library target/aarch64-apple-ios/release/libecliptix_protocol.a \
+            -library target/libecliptix_protocol_sim.a \
             -output dist/apple/EcliptixProtectedProtocol.xcframework
           cd dist/apple && zip -r EcliptixProtectedProtocol.xcframework.zip EcliptixProtectedProtocol.xcframework
           shasum -a 256 EcliptixProtectedProtocol.xcframework.zip > EcliptixProtectedProtocol.xcframework.zip.sha256
