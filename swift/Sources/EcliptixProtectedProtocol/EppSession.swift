@@ -42,7 +42,7 @@ public final class EppSession {
     ///   or another `EppError` if encryption fails.
     public func encrypt(
         plaintext: Data,
-        envelopeType: UInt32 = EPP_ENVELOPE_REQUEST,
+        envelopeType: UInt32 = 0, // EPP_ENVELOPE_REQUEST
         envelopeId: UInt32 = 0,
         correlationId: String = ""
     ) throws -> Data {
