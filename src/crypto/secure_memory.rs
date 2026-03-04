@@ -132,7 +132,7 @@ mod inner {
             if mlocked {
                 unsafe {
                     libc::madvise(
-                        data.as_mut_ptr() as *mut libc::c_void,
+                        data.as_mut_ptr().cast::<libc::c_void>(),
                         data.len(),
                         libc::MADV_DONTDUMP,
                     );

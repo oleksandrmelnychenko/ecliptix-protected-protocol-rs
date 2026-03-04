@@ -2,7 +2,7 @@
 name = "ecliptix-protocol"
 version = "1.0.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.86"
 description = "Ecliptix Signal Protocol-like double ratchet with X3DH and post-quantum hybrid encryption"
 license = "MIT"
 

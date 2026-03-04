@@ -133,7 +133,7 @@ let policy = group.security_policy();
 
 ### Prerequisites
 
-- Rust 1.85+ (stable)
+- Rust 1.86+ (stable)
 - CMake + Ninja (for liboqs build)
 - protobuf-compiler
 
@@ -415,7 +415,7 @@ GitHub Actions pipeline with 8 jobs:
 | **Check & Clippy** | `cargo check` + `cargo clippy -- -D warnings` (with and without `ffi` feature) |
 | **Test** | `cargo test --release` on Linux, macOS, Windows (421 tests with FFI) |
 | **Formal Verification** | Tamarin Prover (10 lemmas) + ProVerif (6 queries) |
-| **MSRV** | Minimum supported Rust version (1.85) |
+| **MSRV** | Minimum supported Rust version (1.86) |
 | **Fuzz Smoke Test** | All 32 libfuzzer targets (10s each) |
 | **Security Audit** | `cargo audit` for known vulnerabilities |
 | **Security Scan** | cargo-deny, TruffleHog secret scanning, license compliance |

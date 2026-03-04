@@ -120,7 +120,7 @@ jobs:
         run: make -C formal proverif
 
   msrv:
-    name: MSRV (1.85)
+    name: MSRV (1.86)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
@@ -132,7 +132,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@21dc36fb71dd22e3317045c0c31a3f4249868b17
         with:
-          toolchain: "1.85"
+          toolchain: "1.86"
 
       - uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84 # v2.7.3
 
