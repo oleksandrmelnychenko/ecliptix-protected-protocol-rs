@@ -10,7 +10,7 @@ import Foundation
 /// The policy defines limits on messages per epoch, skipped keys, and whether
 /// features like external join, enhanced key schedule, and mandatory franking
 /// are enabled.
-public struct EppGroupSecurityPolicy {
+public struct EppGroupSecurityPolicy: Sendable {
 
     /// Maximum number of messages allowed per epoch before a commit is required.
     public var maxMessagesPerEpoch: UInt32
