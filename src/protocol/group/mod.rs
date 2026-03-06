@@ -792,6 +792,7 @@ impl GroupSession {
 
         let epoch_keys = processed.epoch_keys;
 
+        let mut reinit_event: Option<(Vec<u8>, u32)> = None;
         for proposal in &commit_msg.proposals {
             if let Some(crate::proto::group_proposal::Proposal::ReInit(ref reinit)) =
                 proposal.proposal
@@ -800,6 +801,7 @@ impl GroupSession {
                     new_group_id: reinit.new_group_id.clone(),
                     new_version: reinit.new_version,
                 });
+                reinit_event = Some((reinit.new_group_id.clone(), reinit.new_version));
             }
         }
 
@@ -842,6 +844,9 @@ impl GroupSession {
                 }
             }
             handler.on_epoch_advanced(inner.epoch, inner.tree.member_count());
+            if let Some((ref new_group_id, new_version)) = reinit_event {
+                handler.on_reinit_proposed(new_group_id, new_version);
+            }
         }
 
         Ok(())

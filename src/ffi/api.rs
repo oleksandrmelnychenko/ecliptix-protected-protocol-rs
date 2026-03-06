@@ -31,9 +31,11 @@ use crate::core::errors::ProtocolError;
 use crate::crypto::SecureMemoryHandle;
 use crate::crypto::{CryptoInterop, KyberInterop};
 use crate::identity::IdentityKeys;
+use crate::interfaces::{IGroupEventHandler, IIdentityEventHandler, IProtocolEventHandler};
 use crate::proto::{OneTimePreKey, PreKeyBundle, SecureEnvelope};
 use crate::protocol::group::{GroupSecurityPolicy, GroupSession};
 use crate::protocol::{HandshakeInitiator, HandshakeResponder, Session};
+use std::os::raw::c_void;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3268,6 +3270,615 @@ pub unsafe extern "C" fn epp_group_get_pending_reinit(
             }
             Err(e) => return write_protocol_error(out_error, &e),
         }
+        EppErrorCode::EppSuccess
+    })
+}
+
+// ─── Session identity / ID getters ─────────────────────────────────────────
+
+/// Fixed-size struct for returning a peer's or local identity public keys.
+/// Both fields are 32-byte raw public keys; no heap allocation.
+#[repr(C)]
+pub struct EppSessionPeerIdentity {
+    pub ed25519_public: [u8; ED25519_PUBLIC_KEY_BYTES],
+    pub x25519_public: [u8; X25519_PUBLIC_KEY_BYTES],
+}
+
+/// # Safety
+/// See module-level FFI safety contract.
+#[no_mangle]
+pub unsafe extern "C" fn epp_session_get_id(
+    handle: *mut EppSessionHandle,
+    out_session_id: *mut EppBuffer,
+    out_error: *mut EppError,
+) -> EppErrorCode {
+    ffi_catch_panic!(out_error, unsafe {
+        if out_session_id.is_null() {
+            write_error(
+                out_error,
+                EppErrorCode::EppErrorNullPointer,
+                "out_session_id is null",
+            );
+            return EppErrorCode::EppErrorNullPointer;
+        }
+        let session = match require_session_mut(handle, out_error) {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
+        write_buffer(out_session_id, session.get_session_id());
+        EppErrorCode::EppSuccess
+    })
+}
+
+/// # Safety
+/// See module-level FFI safety contract.
+#[no_mangle]
+pub unsafe extern "C" fn epp_session_get_peer_identity(
+    handle: *mut EppSessionHandle,
+    out_identity: *mut EppSessionPeerIdentity,
+    out_error: *mut EppError,
+) -> EppErrorCode {
+    ffi_catch_panic!(out_error, unsafe {
+        if out_identity.is_null() {
+            write_error(
+                out_error,
+                EppErrorCode::EppErrorNullPointer,
+                "out_identity is null",
+            );
+            return EppErrorCode::EppErrorNullPointer;
+        }
+        let session = match require_session_mut(handle, out_error) {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
+        let peer = session.get_peer_identity();
+        if peer.ed25519_public.len() != ED25519_PUBLIC_KEY_BYTES
+            || peer.x25519_public.len() != X25519_PUBLIC_KEY_BYTES
+        {
+            write_error(
+                out_error,
+                EppErrorCode::EppErrorInvalidState,
+                "Peer identity keys have unexpected length",
+            );
+            return EppErrorCode::EppErrorInvalidState;
+        }
+        let mut result = EppSessionPeerIdentity {
+            ed25519_public: [0u8; ED25519_PUBLIC_KEY_BYTES],
+            x25519_public: [0u8; X25519_PUBLIC_KEY_BYTES],
+        };
+        result.ed25519_public.copy_from_slice(&peer.ed25519_public);
+        result.x25519_public.copy_from_slice(&peer.x25519_public);
+        *out_identity = result;
+        EppErrorCode::EppSuccess
+    })
+}
+
+/// # Safety
+/// See module-level FFI safety contract.
+#[no_mangle]
+pub unsafe extern "C" fn epp_session_get_local_identity(
+    handle: *mut EppSessionHandle,
+    out_identity: *mut EppSessionPeerIdentity,
+    out_error: *mut EppError,
+) -> EppErrorCode {
+    ffi_catch_panic!(out_error, unsafe {
+        if out_identity.is_null() {
+            write_error(
+                out_error,
+                EppErrorCode::EppErrorNullPointer,
+                "out_identity is null",
+            );
+            return EppErrorCode::EppErrorNullPointer;
+        }
+        let session = match require_session_mut(handle, out_error) {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
+        let local = session.get_local_identity();
+        if local.ed25519_public.len() != ED25519_PUBLIC_KEY_BYTES
+            || local.x25519_public.len() != X25519_PUBLIC_KEY_BYTES
+        {
+            write_error(
+                out_error,
+                EppErrorCode::EppErrorInvalidState,
+                "Local identity keys have unexpected length",
+            );
+            return EppErrorCode::EppErrorInvalidState;
+        }
+        let mut result = EppSessionPeerIdentity {
+            ed25519_public: [0u8; ED25519_PUBLIC_KEY_BYTES],
+            x25519_public: [0u8; X25519_PUBLIC_KEY_BYTES],
+        };
+        result.ed25519_public.copy_from_slice(&local.ed25519_public);
+        result.x25519_public.copy_from_slice(&local.x25519_public);
+        *out_identity = result;
+        EppErrorCode::EppSuccess
+    })
+}
+
+// ─── OTK replenishment ─────────────────────────────────────────────────────
+
+/// Generates `count` fresh OTKs, adds them to the identity's local pool, and
+/// returns a partial PreKeyBundle proto (only one_time_pre_keys populated)
+/// suitable for uploading to the key server.  Release with epp_buffer_release.
+///
+/// # Safety
+/// See module-level FFI safety contract.
+#[no_mangle]
+pub unsafe extern "C" fn epp_prekey_bundle_replenish(
+    identity_handle: *mut EppIdentityHandle,
+    count: u32,
+    out_keys: *mut EppBuffer,
+    out_error: *mut EppError,
+) -> EppErrorCode {
+    ffi_catch_panic!(out_error, unsafe {
+        if out_keys.is_null() {
+            write_error(
+                out_error,
+                EppErrorCode::EppErrorNullPointer,
+                "out_keys is null",
+            );
+            return EppErrorCode::EppErrorNullPointer;
+        }
+        if count == 0 {
+            write_error(
+                out_error,
+                EppErrorCode::EppErrorInvalidInput,
+                "count must be > 0",
+            );
+            return EppErrorCode::EppErrorInvalidInput;
+        }
+        let identity = match require_identity_mut(identity_handle, out_error) {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
+        let pairs = match identity.replenish_one_time_pre_keys(count) {
+            Ok(p) => p,
+            Err(e) => return write_protocol_error(out_error, &e),
+        };
+        let proto_opks: Vec<OneTimePreKey> = pairs
+            .into_iter()
+            .map(|(id, pk)| OneTimePreKey {
+                one_time_pre_key_id: id,
+                public_key: pk,
+            })
+            .collect();
+        let partial_bundle = PreKeyBundle {
+            version: PROTOCOL_VERSION,
+            one_time_pre_keys: proto_opks,
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        if let Err(e) = partial_bundle.encode(&mut buf) {
+            write_error(
+                out_error,
+                EppErrorCode::EppErrorEncode,
+                &format!("Failed to encode replenished OTKs: {e}"),
+            );
+            return EppErrorCode::EppErrorEncode;
+        }
+        write_buffer(out_keys, buf);
+        EppErrorCode::EppSuccess
+    })
+}
+
+// ─── EnvelopeMetadata parsing ──────────────────────────────────────────────
+
+/// Parsed envelope metadata; correlation_id is heap-allocated (may be NULL).
+/// Free the contents with epp_envelope_metadata_free() after use.
+/// Do NOT free the struct itself — it is caller-allocated.
+#[repr(C)]
+pub struct EppEnvelopeMetadata {
+    pub envelope_type: EppEnvelopeType,
+    pub envelope_id: u32,
+    pub message_index: u64,
+    pub correlation_id: *mut c_char,
+    pub correlation_id_length: usize,
+}
+
+/// # Safety
+/// `(metadata_bytes, metadata_length)` must form a valid readable slice.
+/// `out_meta` must point to writable EppEnvelopeMetadata.
+#[no_mangle]
+pub unsafe extern "C" fn epp_envelope_metadata_parse(
+    metadata_bytes: *const u8,
+    metadata_length: usize,
+    out_meta: *mut EppEnvelopeMetadata,
+    out_error: *mut EppError,
+) -> EppErrorCode {
+    ffi_catch_panic!(out_error, unsafe {
+        if metadata_bytes.is_null() || out_meta.is_null() {
+            write_error(
+                out_error,
+                EppErrorCode::EppErrorNullPointer,
+                "A required pointer is null",
+            );
+            return EppErrorCode::EppErrorNullPointer;
+        }
+        let slice = std::slice::from_raw_parts(metadata_bytes, metadata_length);
+        let proto = match crate::proto::EnvelopeMetadata::decode(slice) {
+            Ok(m) => m,
+            Err(e) => {
+                write_error(
+                    out_error,
+                    EppErrorCode::EppErrorDecode,
+                    &format!("Failed to decode EnvelopeMetadata: {e}"),
+                );
+                return EppErrorCode::EppErrorDecode;
+            }
+        };
+        let envelope_type = match proto.envelope_type {
+            0 => EppEnvelopeType::EppEnvelopeRequest,
+            1 => EppEnvelopeType::EppEnvelopeResponse,
+            2 => EppEnvelopeType::EppEnvelopeNotification,
+            3 => EppEnvelopeType::EppEnvelopeHeartbeat,
+            4 => EppEnvelopeType::EppEnvelopeErrorResponse,
+            _ => EppEnvelopeType::EppEnvelopeRequest,
+        };
+        let (correlation_id_ptr, correlation_id_length) =
+            if let Some(ref cid) = proto.correlation_id {
+                let cstr = CString::new(cid.as_str()).unwrap_or_default();
+                let len = cstr.as_bytes().len();
+                (cstr.into_raw(), len)
+            } else {
+                (std::ptr::null_mut(), 0)
+            };
+        *out_meta = EppEnvelopeMetadata {
+            envelope_type,
+            envelope_id: proto.envelope_id,
+            message_index: proto.message_index,
+            correlation_id: correlation_id_ptr,
+            correlation_id_length,
+        };
+        EppErrorCode::EppSuccess
+    })
+}
+
+/// # Safety
+/// `meta` must point to an EppEnvelopeMetadata populated by
+/// epp_envelope_metadata_parse().  Frees correlation_id if non-null.
+/// Does NOT free the meta struct itself (caller-allocated).
+#[no_mangle]
+pub unsafe extern "C" fn epp_envelope_metadata_free(meta: *mut EppEnvelopeMetadata) {
+    if meta.is_null() {
+        return;
+    }
+    unsafe {
+        if !(*meta).correlation_id.is_null() {
+            drop(CString::from_raw((*meta).correlation_id));
+            (*meta).correlation_id = std::ptr::null_mut();
+            (*meta).correlation_id_length = 0;
+        }
+    }
+}
+
+// ─── C event callbacks — 1-to-1 session ────────────────────────────────────
+
+/// Called when the handshake is complete and the session is established.
+/// `session_id` / `session_id_len` are the 16-byte session identifier.
+pub type EppOnHandshakeCompleted = Option<
+    unsafe extern "C" fn(session_id: *const u8, session_id_len: usize, user_data: *mut c_void),
+>;
+
+/// Called every time the DH ratchet rotates (a new ratchet epoch begins).
+pub type EppOnRatchetRotated =
+    Option<unsafe extern "C" fn(epoch: u64, user_data: *mut c_void)>;
+
+/// Called on an internal protocol error (non-fatal; logged for diagnostics).
+/// `code` is the error category; `message` is a null-terminated description.
+pub type EppOnSessionError = Option<
+    unsafe extern "C" fn(code: EppErrorCode, message: *const c_char, user_data: *mut c_void),
+>;
+
+/// Called when fewer than ~20 % of the nonce budget remains for the current
+/// chain.  The app should send or receive a message to trigger a ratchet step.
+pub type EppOnNonceExhaustionWarning = Option<
+    unsafe extern "C" fn(remaining: u64, max_capacity: u64, user_data: *mut c_void),
+>;
+
+/// Called when many messages have been sent without a DH ratchet step
+/// (the peer may be offline).  Consider forcing a ratchet reset.
+pub type EppOnRatchetStallingWarning =
+    Option<unsafe extern "C" fn(messages_since_ratchet: u64, user_data: *mut c_void)>;
+
+/// Set of C function-pointer callbacks for a 1-to-1 session.
+/// Any slot may be NULL to ignore that event.
+/// `user_data` is passed unchanged to every callback.
+#[repr(C)]
+pub struct EppSessionEventCallbacks {
+    pub on_handshake_completed: EppOnHandshakeCompleted,
+    pub on_ratchet_rotated: EppOnRatchetRotated,
+    pub on_error: EppOnSessionError,
+    pub on_nonce_exhaustion_warning: EppOnNonceExhaustionWarning,
+    pub on_ratchet_stalling_warning: EppOnRatchetStallingWarning,
+    /// Arbitrary pointer passed verbatim to every callback.  May be NULL.
+    /// The library never reads or writes through this pointer.
+    pub user_data: *mut c_void,
+}
+
+/// Internal Rust bridge: holds the C callback vtable and implements the
+/// `IProtocolEventHandler` trait so the session can fire events.
+struct CFfiSessionEventHandler {
+    callbacks: EppSessionEventCallbacks,
+}
+
+// Safety: C function pointers and *mut c_void are safe to move across threads
+// when the caller guarantees thread-safe user_data access.
+unsafe impl Send for CFfiSessionEventHandler {}
+unsafe impl Sync for CFfiSessionEventHandler {}
+
+impl IProtocolEventHandler for CFfiSessionEventHandler {
+    fn on_handshake_completed(&self, session_id: &[u8]) {
+        if let Some(cb) = self.callbacks.on_handshake_completed {
+            unsafe { cb(session_id.as_ptr(), session_id.len(), self.callbacks.user_data) };
+        }
+    }
+
+    fn on_ratchet_rotated(&self, epoch: u64) {
+        if let Some(cb) = self.callbacks.on_ratchet_rotated {
+            unsafe { cb(epoch, self.callbacks.user_data) };
+        }
+    }
+
+    fn on_error(&self, error: &ProtocolError) {
+        if let Some(cb) = self.callbacks.on_error {
+            let code = error_code_from_protocol(error);
+            let msg = CString::new(error.to_string()).unwrap_or_default();
+            unsafe { cb(code, msg.as_ptr(), self.callbacks.user_data) };
+        }
+    }
+
+    fn on_nonce_exhaustion_warning(&self, remaining: u64, max_capacity: u64) {
+        if let Some(cb) = self.callbacks.on_nonce_exhaustion_warning {
+            unsafe { cb(remaining, max_capacity, self.callbacks.user_data) };
+        }
+    }
+
+    fn on_ratchet_stalling_warning(&self, messages_since_ratchet: u64) {
+        if let Some(cb) = self.callbacks.on_ratchet_stalling_warning {
+            unsafe { cb(messages_since_ratchet, self.callbacks.user_data) };
+        }
+    }
+}
+
+/// Register C event callbacks on a 1-to-1 session.
+///
+/// # Safety
+/// See module-level FFI safety contract.
+/// `callbacks` is copied by value; user_data must remain valid until the session
+/// is destroyed or a new handler replaces this one.
+#[no_mangle]
+pub unsafe extern "C" fn epp_session_set_event_handler(
+    handle: *mut EppSessionHandle,
+    callbacks: *const EppSessionEventCallbacks,
+    out_error: *mut EppError,
+) -> EppErrorCode {
+    ffi_catch_panic!(out_error, unsafe {
+        if callbacks.is_null() {
+            write_error(
+                out_error,
+                EppErrorCode::EppErrorNullPointer,
+                "callbacks is null",
+            );
+            return EppErrorCode::EppErrorNullPointer;
+        }
+        let session = match require_session_mut(handle, out_error) {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
+        // Safety: callbacks points to a valid EppSessionEventCallbacks for the
+        // duration of this call; we immediately copy all fields.
+        let cbs = std::ptr::read(callbacks);
+        let handler = Arc::new(CFfiSessionEventHandler { callbacks: cbs });
+        session.set_event_handler(handler);
+        EppErrorCode::EppSuccess
+    })
+}
+
+// ─── C event callbacks — group session ─────────────────────────────────────
+
+/// Called when a new member is added to the group via a Commit.
+/// `identity_ed25519` / `identity_ed25519_len` are the new member's 32-byte
+/// Ed25519 public key.
+pub type EppOnMemberAdded = Option<
+    unsafe extern "C" fn(
+        leaf_index: u32,
+        identity_ed25519: *const u8,
+        identity_ed25519_len: usize,
+        user_data: *mut c_void,
+    ),
+>;
+
+/// Called when a member is removed from the group via a Commit.
+pub type EppOnMemberRemoved =
+    Option<unsafe extern "C" fn(leaf_index: u32, user_data: *mut c_void)>;
+
+/// Called every time a Commit is applied and the epoch number advances.
+pub type EppOnEpochAdvanced = Option<
+    unsafe extern "C" fn(new_epoch: u64, member_count: u32, user_data: *mut c_void),
+>;
+
+/// Called when the sender-key generation counter for this member is running
+/// low (approaching max_messages_per_epoch).  Trigger an Update commit soon.
+pub type EppOnSenderKeyExhaustionWarning = Option<
+    unsafe extern "C" fn(remaining: u32, max_capacity: u32, user_data: *mut c_void),
+>;
+
+/// Called when a ReInit proposal is applied in a Commit.
+/// The group is now deprecated; migrate to `new_group_id` at `new_version`.
+/// `new_group_id` / `new_group_id_len` are valid only for the duration of
+/// the callback.
+pub type EppOnReInitProposed = Option<
+    unsafe extern "C" fn(
+        new_group_id: *const u8,
+        new_group_id_len: usize,
+        new_version: u32,
+        user_data: *mut c_void,
+    ),
+>;
+
+/// Set of C function-pointer callbacks for a group session.
+/// Any slot may be NULL to ignore that event.
+/// `user_data` is passed unchanged to every callback.
+#[repr(C)]
+pub struct EppGroupEventCallbacks {
+    pub on_member_added: EppOnMemberAdded,
+    pub on_member_removed: EppOnMemberRemoved,
+    pub on_epoch_advanced: EppOnEpochAdvanced,
+    pub on_sender_key_exhaustion_warning: EppOnSenderKeyExhaustionWarning,
+    pub on_reinit_proposed: EppOnReInitProposed,
+    /// Arbitrary pointer passed verbatim to every callback.  May be NULL.
+    pub user_data: *mut c_void,
+}
+
+struct CFfiGroupEventHandler {
+    callbacks: EppGroupEventCallbacks,
+}
+
+unsafe impl Send for CFfiGroupEventHandler {}
+unsafe impl Sync for CFfiGroupEventHandler {}
+
+impl IGroupEventHandler for CFfiGroupEventHandler {
+    fn on_member_added(&self, leaf_index: u32, identity_ed25519: &[u8]) {
+        if let Some(cb) = self.callbacks.on_member_added {
+            unsafe {
+                cb(
+                    leaf_index,
+                    identity_ed25519.as_ptr(),
+                    identity_ed25519.len(),
+                    self.callbacks.user_data,
+                )
+            };
+        }
+    }
+
+    fn on_member_removed(&self, leaf_index: u32) {
+        if let Some(cb) = self.callbacks.on_member_removed {
+            unsafe { cb(leaf_index, self.callbacks.user_data) };
+        }
+    }
+
+    fn on_epoch_advanced(&self, new_epoch: u64, member_count: u32) {
+        if let Some(cb) = self.callbacks.on_epoch_advanced {
+            unsafe { cb(new_epoch, member_count, self.callbacks.user_data) };
+        }
+    }
+
+    fn on_sender_key_exhaustion_warning(&self, remaining: u32, max_capacity: u32) {
+        if let Some(cb) = self.callbacks.on_sender_key_exhaustion_warning {
+            unsafe { cb(remaining, max_capacity, self.callbacks.user_data) };
+        }
+    }
+
+    fn on_reinit_proposed(&self, new_group_id: &[u8], new_version: u32) {
+        if let Some(cb) = self.callbacks.on_reinit_proposed {
+            unsafe {
+                cb(
+                    new_group_id.as_ptr(),
+                    new_group_id.len(),
+                    new_version,
+                    self.callbacks.user_data,
+                )
+            };
+        }
+    }
+}
+
+/// Register C event callbacks on a group session.
+///
+/// # Safety
+/// See module-level FFI safety contract.
+/// `callbacks` is copied by value; user_data must remain valid until the session
+/// is destroyed or a new handler replaces this one.
+#[no_mangle]
+pub unsafe extern "C" fn epp_group_set_event_handler(
+    handle: *mut EppGroupSessionHandle,
+    callbacks: *const EppGroupEventCallbacks,
+    out_error: *mut EppError,
+) -> EppErrorCode {
+    ffi_catch_panic!(out_error, unsafe {
+        if callbacks.is_null() {
+            write_error(
+                out_error,
+                EppErrorCode::EppErrorNullPointer,
+                "callbacks is null",
+            );
+            return EppErrorCode::EppErrorNullPointer;
+        }
+        let session = match require_group_mut(handle, out_error) {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
+        let cbs = std::ptr::read(callbacks);
+        let handler = Arc::new(CFfiGroupEventHandler { callbacks: cbs });
+        session.set_event_handler(handler);
+        EppErrorCode::EppSuccess
+    })
+}
+
+// ─── C event callbacks — identity ──────────────────────────────────────────
+
+/// Called after an OTK is consumed and the remaining pool has dropped below
+/// the exhaustion-warning threshold (default: ≤ 10 % of max_capacity).
+/// Upload fresh OTKs via `epp_prekey_bundle_replenish` before supply runs out.
+pub type EppOnOtkExhaustionWarning = Option<
+    unsafe extern "C" fn(remaining: u32, max_capacity: u32, user_data: *mut c_void),
+>;
+
+/// Set of C function-pointer callbacks for an identity handle.
+/// Any slot may be NULL to ignore that event.
+/// `user_data` is passed unchanged to every callback.
+#[repr(C)]
+pub struct EppIdentityEventCallbacks {
+    pub on_otk_exhaustion_warning: EppOnOtkExhaustionWarning,
+    /// Arbitrary pointer passed verbatim to every callback.  May be NULL.
+    /// The library never reads or writes through this pointer.
+    pub user_data: *mut c_void,
+}
+
+struct CFfiIdentityEventHandler {
+    callbacks: EppIdentityEventCallbacks,
+}
+
+unsafe impl Send for CFfiIdentityEventHandler {}
+unsafe impl Sync for CFfiIdentityEventHandler {}
+
+impl IIdentityEventHandler for CFfiIdentityEventHandler {
+    fn on_otk_exhaustion_warning(&self, remaining: u32, max_capacity: u32) {
+        if let Some(cb) = self.callbacks.on_otk_exhaustion_warning {
+            unsafe { cb(remaining, max_capacity, self.callbacks.user_data) };
+        }
+    }
+}
+
+/// Register C event callbacks on an identity handle.
+///
+/// # Safety
+/// See module-level FFI safety contract.
+/// `callbacks` is copied by value; `user_data` must remain valid until the
+/// identity is destroyed or a new handler replaces this one.
+#[no_mangle]
+pub unsafe extern "C" fn epp_identity_set_event_handler(
+    handle: *mut EppIdentityHandle,
+    callbacks: *const EppIdentityEventCallbacks,
+    out_error: *mut EppError,
+) -> EppErrorCode {
+    ffi_catch_panic!(out_error, unsafe {
+        if callbacks.is_null() {
+            write_error(
+                out_error,
+                EppErrorCode::EppErrorNullPointer,
+                "callbacks is null",
+            );
+            return EppErrorCode::EppErrorNullPointer;
+        }
+        let identity = match require_identity_mut(handle, out_error) {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
+        let cbs = std::ptr::read(callbacks);
+        let handler = Arc::new(CFfiIdentityEventHandler { callbacks: cbs });
+        identity.set_event_handler(handler);
         EppErrorCode::EppSuccess
     })
 }
