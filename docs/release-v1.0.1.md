@@ -16,14 +16,14 @@
 .binaryTarget(
     name: "EcliptixProtectedProtocolBinary",
     url: "https://github.com/oleksandrmelnychenko/ecliptix-protected-protocol-rs/releases/download/v1.0.1/ecliptix-protected-protocol.xcframework.zip",
-    checksum: "9171c6bdb4158202562ca681150fe375702286443b087f6bab3b459a1eceedcd"
+    checksum: "7d5f43bd4eb899d0837d34754d727db48d2fe52ebe2e2c57071c3097775ace85"
 )
 ```
 
 ## Release Artifacts
 
 - archive: `dist/apple/ecliptix-protected-protocol.xcframework.zip`
-- sha256: `9171c6bdb4158202562ca681150fe375702286443b087f6bab3b459a1eceedcd`
+- sha256: `7d5f43bd4eb899d0837d34754d727db48d2fe52ebe2e2c57071c3097775ace85`
 
 ## Notable Breaking Changes
 
