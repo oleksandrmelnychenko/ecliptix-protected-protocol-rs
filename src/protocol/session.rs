@@ -2166,6 +2166,15 @@ impl Session {
             .is_initiator
     }
 
+    pub fn get_session_id(&self) -> Vec<u8> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .state
+            .session_id
+            .clone()
+    }
+
     pub fn get_peer_identity(&self) -> PeerIdentity {
         let inner = self
             .inner

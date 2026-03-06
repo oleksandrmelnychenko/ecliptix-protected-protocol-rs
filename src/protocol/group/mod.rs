@@ -755,6 +755,87 @@ impl GroupSession {
         Ok(bytes)
     }
 
+    /// Create a commit that carries a single ReInit proposal, advancing the committer's
+    /// epoch.  Other members must process the returned bytes via [`process_commit`],
+    /// which fires [`IGroupEventHandler::on_reinit_proposed`] on their sessions.
+    ///
+    /// `new_group_id` must be exactly [`GROUP_ID_BYTES`] (32) bytes.
+    pub fn create_reinit_commit(
+        &self,
+        new_group_id: Vec<u8>,
+        new_version: u32,
+    ) -> Result<Vec<u8>, ProtocolError> {
+        if new_group_id.len() != GROUP_ID_BYTES {
+            return Err(ProtocolError::invalid_input(format!(
+                "create_reinit_commit: new_group_id must be {} bytes, got {}",
+                GROUP_ID_BYTES,
+                new_group_id.len()
+            )));
+        }
+
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| ProtocolError::invalid_state("GroupSession lock poisoned"))?;
+
+        let my_leaf_idx = inner.my_leaf_idx;
+        let init_secret = Zeroizing::new(inner.init_secret.clone());
+        let group_id = inner.group_id.clone();
+        let epoch = inner.epoch;
+        let mut ed25519_sk = inner
+            .my_ed25519_secret
+            .read_bytes(ED25519_SECRET_KEY_BYTES)
+            .map_err(ProtocolError::from_crypto)?;
+        let psk_resolver = inner.psk_resolver.take();
+        let policy = inner.security_policy.clone();
+
+        let reinit_proposal = GroupProposal {
+            proposal: Some(crate::proto::group_proposal::Proposal::ReInit(
+                crate::proto::GroupReInitProposal {
+                    new_group_id,
+                    new_version,
+                },
+            )),
+        };
+
+        let commit_output = commit::create_commit(
+            &mut inner.tree,
+            vec![reinit_proposal],
+            my_leaf_idx,
+            init_secret.as_slice(),
+            &group_id,
+            epoch,
+            &ed25519_sk,
+            psk_resolver.as_deref(),
+            &policy,
+        );
+        inner.psk_resolver = psk_resolver;
+        CryptoInterop::secure_wipe(&mut ed25519_sk);
+        let commit_output = commit_output?;
+
+        inner
+            .init_secret
+            .clone_from(&commit_output.epoch_keys.init_secret);
+        inner.epoch = commit_output.commit.epoch;
+        inner.epoch_keys = commit_output.epoch_keys;
+        inner.sender_store = commit_output.new_sender_store;
+        inner.group_context_hash = commit_output.group_context_hash;
+        inner.seen_message_ids.clear();
+        inner.seen_message_ids_order.clear();
+
+        let (_ext_priv, ext_x25519_pub, _ext_kyber_sec, ext_kyber_pub) =
+            GroupKeySchedule::derive_external_keypairs(&inner.init_secret)?;
+        inner.external_x25519_public = ext_x25519_pub;
+        inner.external_kyber_public = ext_kyber_pub;
+
+        let mut bytes = Vec::new();
+        commit_output
+            .commit
+            .encode(&mut bytes)
+            .map_err(|e| ProtocolError::encode(format!("Commit encode: {e}")))?;
+        Ok(bytes)
+    }
+
     pub fn process_commit(&self, commit_bytes: &[u8]) -> Result<(), ProtocolError> {
         if commit_bytes.len() > MAX_GROUP_MESSAGE_SIZE {
             return Err(ProtocolError::invalid_input(format!(

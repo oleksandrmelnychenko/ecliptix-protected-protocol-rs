@@ -36,6 +36,7 @@ use crate::proto::{OneTimePreKey, PreKeyBundle, SecureEnvelope};
 use crate::protocol::group::{GroupSecurityPolicy, GroupSession};
 use crate::protocol::{HandshakeInitiator, HandshakeResponder, Session};
 use std::os::raw::c_void;
+use std::sync::Arc;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -8437,3 +8437,192 @@ fn secure_memory_try_clone_roundtrip() {
     let read_back = cloned.read_bytes(32).unwrap();
     assert_eq!(read_back, data);
 }
+
+/// Simulate exact gateway flow: seed-based server + random client via EcliptixProtocol API.
+/// This is what happens when iOS client connects to gateway.
+#[test]
+fn gateway_flow_seed_server_random_client_handshake() {
+    init();
+    use ecliptix_protocol::api::EcliptixProtocol;
+    use sha2::{Sha256, Digest};
+
+    // Server: create from seed (like gateway does with EPP_SECRET_KEY_SEED)
+    let raw_seed = b"test-seed-for-gateway-1234";
+    let mut hasher = Sha256::new();
+    hasher.update(raw_seed);
+    let seed_32: Vec<u8> = hasher.finalize().to_vec();
+    let mut server = EcliptixProtocol::from_seed(&seed_32, "server", 100).unwrap();
+
+    // Client: random identity (like iOS does with epp_identity_create)
+    let mut client = EcliptixProtocol::new(5).unwrap();
+
+    // Step 1: Client gets server's prekey bundle (event 105)
+    let server_bundle_bytes = server.pre_key_bundle().unwrap();
+
+    // Step 2: Client initiates handshake (event 102 request)
+    let (initiator, init_bytes) = client.begin_session(&server_bundle_bytes).unwrap();
+
+    // Step 3: Server processes handshake (accept_session)
+    let (responder, ack_bytes) = server.accept_session(&init_bytes).unwrap();
+
+    // Step 4: Both complete sessions
+    let mut server_session = responder.complete().unwrap();
+    let mut client_session = initiator.complete(&ack_bytes).unwrap();
+
+    // Step 5: Encrypt/decrypt test
+    let env = client_session.encrypt(b"hello from iOS", 0, 1, None).unwrap();
+    let dec = server_session.decrypt(&env).unwrap();
+    assert_eq!(dec.plaintext, b"hello from iOS");
+}
+
+/// Same as above but use cached bundle (like FFI path does)
+#[test]
+fn gateway_flow_cached_bundle_handshake() {
+    init();
+    use ecliptix_protocol::api::EcliptixProtocol;
+
+    let mut server = EcliptixProtocol::new(100).unwrap();
+    let mut client = EcliptixProtocol::new(5).unwrap();
+
+    // Server caches bundle at startup
+    let cached_bundle_bytes = server.pre_key_bundle().unwrap();
+
+    // Client gets cached bundle
+    let (initiator, init_bytes) = client.begin_session(&cached_bundle_bytes).unwrap();
+
+    // Server accepts using accept_session (which generates fresh bundle internally)
+    let (responder, ack_bytes) = server.accept_session(&init_bytes).unwrap();
+
+    let mut server_session = responder.complete().unwrap();
+    let mut client_session = initiator.complete(&ack_bytes).unwrap();
+
+    let env = client_session.encrypt(b"cached bundle works", 0, 1, None).unwrap();
+    let dec = server_session.decrypt(&env).unwrap();
+    assert_eq!(dec.plaintext, b"cached bundle works");
+}
+
+/// Test that pre_key_bundle() returns different bytes on each call (one-time pre-keys differ).
+/// This simulates the mismatch between cached bundle sent to client vs fresh bundle used by accept_session.
+#[test]
+fn gateway_flow_bundle_bytes_stability() {
+    init();
+    use ecliptix_protocol::api::EcliptixProtocol;
+
+    let server = EcliptixProtocol::new(100).unwrap();
+
+    let bundle1 = server.pre_key_bundle().unwrap();
+    let bundle2 = server.pre_key_bundle().unwrap();
+
+    // Check if bundles are identical
+    if bundle1 != bundle2 {
+        println!("CRITICAL: pre_key_bundle() returns DIFFERENT bytes on each call!");
+        println!("  bundle1 len={}, bundle2 len={}", bundle1.len(), bundle2.len());
+    } else {
+        println!("pre_key_bundle() returns identical bytes (deterministic)");
+    }
+    // This assertion checks the hypothesis:
+    assert_eq!(bundle1, bundle2, "pre_key_bundle() must be deterministic for cached-bundle handshake to work");
+}
+
+/// Simulate the exact FFI gateway flow using C FFI functions directly.
+#[test]
+fn gateway_flow_ffi_responder_with_cached_bundle() {
+    init();
+    use ecliptix_protocol::api::EcliptixProtocol;
+
+    let mut server = EcliptixProtocol::new(100).unwrap();
+    let mut client = EcliptixProtocol::new(5).unwrap();
+
+    // Server caches bundle bytes at startup
+    let cached_bundle_bytes = server.pre_key_bundle().unwrap();
+
+    // Client begins session using cached bundle
+    let (initiator, init_bytes) = client.begin_session(&cached_bundle_bytes).unwrap();
+
+    // Server: accept_session generates fresh bundle internally.
+    // But the cached_bundle_bytes and fresh bundle should be identical
+    // (since identity hasn't changed). Let's verify this:
+    let fresh_bundle_bytes = server.pre_key_bundle().unwrap();
+    assert_eq!(
+        cached_bundle_bytes, fresh_bundle_bytes,
+        "cached and fresh bundles must be identical for same identity"
+    );
+
+    let (responder, ack_bytes) = server.accept_session(&init_bytes).unwrap();
+
+    let mut server_session = responder.complete().unwrap();
+    let mut client_session = initiator.complete(&ack_bytes).unwrap();
+
+    let env = client_session.encrypt(b"ffi cached bundle", 0, 1, None).unwrap();
+    let dec = server_session.decrypt(&env).unwrap();
+    assert_eq!(dec.plaintext, b"ffi cached bundle");
+}
+
+/// Simulates the EXACT iOS→Gateway flow:
+/// 1. Server: from_seed("server") — like gateway does
+/// 2. Server: pre_key_bundle() → cached_bytes — like gateway sends to iOS
+/// 3. Bundle bytes pass through ServerPublicKeysResponse decode→encode (proto roundtrip)
+/// 4. Client: random identity — like iOS creates
+/// 5. Client: begin_session(roundtripped_bundle) — like iOS FFI does
+/// 6. Init bytes pass through EventEnvelope (proto roundtrip as bytes field)
+/// 7. Server: accept_session(init_bytes) — like gateway processes
+#[test]
+fn gateway_flow_full_ios_simulation() {
+    init();
+    use ecliptix_protocol::api::EcliptixProtocol;
+    use sha2::{Sha256, Digest};
+
+    // Step 1: Server creates identity from seed (exactly like gateway)
+    let raw_seed = b"ecliptix-dev-seed-2026-02-27";
+    let mut hasher = Sha256::new();
+    hasher.update(raw_seed);
+    let seed_32: Vec<u8> = hasher.finalize().to_vec();
+    let mut server = EcliptixProtocol::from_seed(&seed_32, "server", 100).unwrap();
+
+    // Step 2: Server generates cached bundle (like handle_server_keys)
+    let cached_bundle_bytes = server.pre_key_bundle().unwrap();
+    let bundle_hash = {
+        let mut h = Sha256::new();
+        h.update(&cached_bundle_bytes);
+        h.finalize()[..8].iter().map(|b| format!("{b:02x}")).collect::<String>()
+    };
+
+    // Step 3: Simulate proto roundtrip through ServerPublicKeysResponse
+    // The bundle is a bytes field - it should pass through unchanged.
+    // But let's verify by decode→encode the PreKeyBundle itself.
+    let decoded_bundle = PreKeyBundle::decode(cached_bundle_bytes.as_slice()).unwrap();
+    let roundtripped_bytes = decoded_bundle.encode_to_vec();
+    assert_eq!(
+        cached_bundle_bytes, roundtripped_bytes,
+        "PreKeyBundle decode→encode must be lossless"
+    );
+
+    // Step 4: Client creates random identity (like iOS epp_identity_create)
+    let mut client = EcliptixProtocol::new(5).unwrap();
+
+    // Step 5: Client begins session (like iOS epp_handshake_initiator_start)
+    let (initiator, init_bytes) = client.begin_session(&cached_bundle_bytes).unwrap();
+
+    // Step 6: init_bytes pass through EventEnvelope as a bytes field - no transformation
+    // But let's simulate decode→encode of HandshakeInit to check
+    let decoded_init = ecliptix_protocol::proto::HandshakeInit::decode(init_bytes.as_slice()).unwrap();
+    let roundtripped_init = decoded_init.encode_to_vec();
+    assert_eq!(
+        init_bytes, roundtripped_init,
+        "HandshakeInit decode→encode must be lossless"
+    );
+
+    // Step 7: Server accepts session (like gateway process_handshake_init_raw → accept_session)
+    let result = server.accept_session(&init_bytes);
+    assert!(result.is_ok(), "accept_session must succeed, got: {:?}", result.err());
+
+    let (responder, ack_bytes) = result.unwrap();
+    let mut server_session = responder.complete().unwrap();
+    let mut client_session = initiator.complete(&ack_bytes).unwrap();
+
+    // Verify end-to-end encryption works
+    let env = client_session.encrypt(b"hello from iOS", 0, 1, None).unwrap();
+    let dec = server_session.decrypt(&env).unwrap();
+    assert_eq!(dec.plaintext, b"hello from iOS");
+    eprintln!("Full iOS simulation: bundle_hash={bundle_hash}, bundle_len={}", cached_bundle_bytes.len());
+}

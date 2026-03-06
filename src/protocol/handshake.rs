@@ -812,6 +812,34 @@ impl HandshakeResponder {
         )
         .map_err(ProtocolError::from_crypto)?;
         if !eq {
+            // Diagnostic: include hashes for debugging MAC mismatch
+            use sha2::{Sha256, Digest as _};
+            fn to_hex(bytes: &[u8]) -> String {
+                bytes.iter().map(|b| format!("{b:02x}")).collect()
+            }
+            let th_hash = {
+                let mut h = Sha256::new();
+                h.update(&transcript_hash);
+                to_hex(&h.finalize()[..8])
+            };
+            let expected_hex = to_hex(&expected_init_mac[..8.min(expected_init_mac.len())]);
+            let received_hex = to_hex(&init_message.key_confirmation_mac[..8.min(init_message.key_confirmation_mac.len())]);
+            let bundle_diag = {
+                let mut bb = Vec::new();
+                local_bundle.encode(&mut bb).ok();
+                let mut h = Sha256::new();
+                h.update(&bb);
+                format!("bundle_len={} bundle_sha={}", bb.len(), to_hex(&h.finalize()[..8]))
+            };
+            let init_diag = {
+                let mut ic = init_message.clone();
+                ic.key_confirmation_mac.clear();
+                let mut ib = Vec::new();
+                ic.encode(&mut ib).ok();
+                let mut h = Sha256::new();
+                h.update(&ib);
+                format!("init_len={} init_sha={}", ib.len(), to_hex(&h.finalize()[..8]))
+            };
             CryptoInterop::secure_wipe(&mut spk_private);
             CryptoInterop::secure_wipe(&mut identity_private);
             if !opk_private.is_empty() {
@@ -821,7 +849,7 @@ impl HandshakeResponder {
             CryptoInterop::secure_wipe(&mut kyber_shared_secret);
             CryptoInterop::secure_wipe(&mut kc_r);
             return Err(ProtocolError::handshake(
-                "Initiator key confirmation failed",
+                format!("Initiator key confirmation failed: th_sha={th_hash} expected_mac={expected_hex} received_mac={received_hex} {bundle_diag} {init_diag}"),
             ));
         }
 
