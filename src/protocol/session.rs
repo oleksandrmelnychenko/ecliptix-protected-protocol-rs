@@ -111,7 +111,6 @@ fn compute_identity_binding_hash(
             "Invalid X25519 identity key sizes for binding",
         ));
     }
-
     let mut ed_keys = [local_ed25519.to_vec(), peer_ed25519.to_vec()];
     if ed_keys[0] > ed_keys[1] {
         ed_keys.swap(0, 1);
@@ -120,7 +119,6 @@ fn compute_identity_binding_hash(
     if x_keys[0] > x_keys[1] {
         x_keys.swap(0, 1);
     }
-
     let mut input = Vec::with_capacity(
         IDENTITY_BINDING_INFO.len()
             + ed_keys[0].len()

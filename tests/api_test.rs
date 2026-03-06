@@ -14,6 +14,30 @@ fn init() {
     });
 }
 
+const fn permissive_group_policy() -> GroupSecurityPolicy {
+    GroupSecurityPolicy {
+        max_messages_per_epoch: 0,
+        max_skipped_keys_per_sender: 0,
+        block_external_join: false,
+        enhanced_key_schedule: false,
+        mandatory_franking: false,
+    }
+}
+
+fn authorize_external_join_api(
+    group: &EcliptixGroupSession,
+    joiner: &EcliptixProtocol,
+    credential: &[u8],
+) -> Vec<u8> {
+    group
+        .authorize_external_join(
+            &joiner.identity_ed25519_public(),
+            &joiner.identity_x25519_public(),
+            credential,
+        )
+        .unwrap()
+}
+
 // ---------------------------------------------------------------------------
 // EcliptixProtocol construction
 // ---------------------------------------------------------------------------
@@ -88,16 +112,12 @@ fn api_p2p_bidirectional_messaging() {
 
     for i in 0..10u32 {
         let msg = format!("alice-{i}");
-        let ct = alice_session
-            .encrypt(msg.as_bytes(), 0, i, None)
-            .unwrap();
+        let ct = alice_session.encrypt(msg.as_bytes(), 0, i, None).unwrap();
         let r = bob_session.decrypt(&ct).unwrap();
         assert_eq!(r.plaintext, msg.as_bytes());
 
         let msg2 = format!("bob-{i}");
-        let ct2 = bob_session
-            .encrypt(msg2.as_bytes(), 1, i, None)
-            .unwrap();
+        let ct2 = bob_session.encrypt(msg2.as_bytes(), 1, i, None).unwrap();
         let r2 = alice_session.decrypt(&ct2).unwrap();
         assert_eq!(r2.plaintext, msg2.as_bytes());
     }
@@ -144,11 +164,13 @@ fn api_p2p_session_serialize_deserialize() {
     let key = vec![0x55u8; 32];
     let sealed = alice_session.serialize(&key, 1).unwrap();
 
-    let counter = ecliptix_protocol::api::EcliptixSession::sealed_external_counter(&sealed).unwrap();
+    let counter =
+        ecliptix_protocol::api::EcliptixSession::sealed_external_counter(&sealed).unwrap();
     assert_eq!(counter, 1);
 
-    let mut restored =
+    let (mut restored, restored_counter) =
         ecliptix_protocol::api::EcliptixSession::deserialize(&sealed, &key, 0).unwrap();
+    assert_eq!(restored_counter, 1);
 
     let ct2 = restored.encrypt(b"after restore", 0, 2, None).unwrap();
     let result = bob_session.decrypt(&ct2).unwrap();
@@ -231,7 +253,9 @@ fn api_group_two_member_lifecycle() {
     let alice_proto = EcliptixProtocol::new(5).unwrap();
     let bob_proto = EcliptixProtocol::new(5).unwrap();
 
-    let alice_group = alice_proto.create_group(b"alice".to_vec()).unwrap();
+    let alice_group = alice_proto
+        .create_group_with_policy(b"alice".to_vec(), permissive_group_policy())
+        .unwrap();
     assert_eq!(alice_group.epoch().unwrap(), 0);
     assert_eq!(alice_group.member_count().unwrap(), 1);
 
@@ -244,7 +268,9 @@ fn api_group_two_member_lifecycle() {
     assert_eq!(alice_group.epoch().unwrap(), 1);
     assert_eq!(alice_group.member_count().unwrap(), 2);
 
-    let bob_group = bob_proto.join_group(&welcome, bob_x25519, bob_kyber).unwrap();
+    let bob_group = bob_proto
+        .join_group(&welcome, bob_x25519, bob_kyber)
+        .unwrap();
     assert_eq!(bob_group.epoch().unwrap(), 1);
     assert_eq!(bob_group.member_count().unwrap(), 2);
 
@@ -303,14 +329,17 @@ fn api_group_external_join() {
     init();
 
     let alice_proto = EcliptixProtocol::new(5).unwrap();
-    let alice_group = alice_proto.create_group(b"alice".to_vec()).unwrap();
+    let alice_group = alice_proto
+        .create_group_with_policy(b"alice".to_vec(), permissive_group_policy())
+        .unwrap();
 
     let public_state = alice_group.export_public_state().unwrap();
     assert!(!public_state.is_empty());
 
     let charlie_proto = EcliptixProtocol::new(5).unwrap();
+    let authorization = authorize_external_join_api(&alice_group, &charlie_proto, b"charlie");
     let (charlie_group, ext_commit) = charlie_proto
-        .join_group_external(&public_state, b"charlie".to_vec())
+        .join_group_external(&public_state, &authorization, b"charlie".to_vec())
         .unwrap();
     assert!(!ext_commit.is_empty());
 
@@ -340,7 +369,9 @@ fn api_group_serialize_deserialize() {
     let counter = EcliptixGroupSession::sealed_external_counter(&sealed).unwrap();
     assert_eq!(counter, 1);
 
-    let restored = EcliptixGroupSession::deserialize(&sealed, &key, ed_secret, 0).unwrap();
+    let (restored, restored_counter) =
+        EcliptixGroupSession::deserialize(&sealed, &key, ed_secret, 0).unwrap();
+    assert_eq!(restored_counter, 1);
     assert_eq!(session.group_id().unwrap(), restored.group_id().unwrap());
     assert_eq!(session.epoch().unwrap(), restored.epoch().unwrap());
     assert_eq!(
@@ -373,11 +404,12 @@ fn api_group_member_leaf_indices() {
     let bob_proto = EcliptixProtocol::new(5).unwrap();
 
     let alice_group = alice_proto.create_group(b"alice".to_vec()).unwrap();
-    let (bob_kp, bob_x25519, bob_kyber) =
-        bob_proto.generate_key_package(b"bob".to_vec()).unwrap();
+    let (bob_kp, bob_x25519, bob_kyber) = bob_proto.generate_key_package(b"bob".to_vec()).unwrap();
 
     let (_commit, welcome) = alice_group.add_member(&bob_kp).unwrap();
-    let _bob_group = bob_proto.join_group(&welcome, bob_x25519, bob_kyber).unwrap();
+    let _bob_group = bob_proto
+        .join_group(&welcome, bob_x25519, bob_kyber)
+        .unwrap();
 
     let indices = alice_group.member_leaf_indices().unwrap();
     assert_eq!(indices.len(), 2);
@@ -392,11 +424,12 @@ fn api_group_encrypt_sealed_roundtrip() {
     let bob_proto = EcliptixProtocol::new(5).unwrap();
 
     let alice_group = alice_proto.create_group(b"alice".to_vec()).unwrap();
-    let (bob_kp, bob_x25519, bob_kyber) =
-        bob_proto.generate_key_package(b"bob".to_vec()).unwrap();
+    let (bob_kp, bob_x25519, bob_kyber) = bob_proto.generate_key_package(b"bob".to_vec()).unwrap();
 
     let (_commit, welcome) = alice_group.add_member(&bob_kp).unwrap();
-    let bob_group = bob_proto.join_group(&welcome, bob_x25519, bob_kyber).unwrap();
+    let bob_group = bob_proto
+        .join_group(&welcome, bob_x25519, bob_kyber)
+        .unwrap();
 
     let ct = alice_group
         .encrypt_sealed(b"secret content", b"hint")
@@ -419,11 +452,12 @@ fn api_group_encrypt_frankable_roundtrip() {
     let bob_proto = EcliptixProtocol::new(5).unwrap();
 
     let alice_group = alice_proto.create_group(b"alice".to_vec()).unwrap();
-    let (bob_kp, bob_x25519, bob_kyber) =
-        bob_proto.generate_key_package(b"bob".to_vec()).unwrap();
+    let (bob_kp, bob_x25519, bob_kyber) = bob_proto.generate_key_package(b"bob".to_vec()).unwrap();
 
     let (_commit, welcome) = alice_group.add_member(&bob_kp).unwrap();
-    let bob_group = bob_proto.join_group(&welcome, bob_x25519, bob_kyber).unwrap();
+    let bob_group = bob_proto
+        .join_group(&welcome, bob_x25519, bob_kyber)
+        .unwrap();
 
     let ct = alice_group.encrypt_frankable(b"frankable msg").unwrap();
     let result = bob_group.decrypt(&ct).unwrap();
@@ -443,11 +477,12 @@ fn api_group_encrypt_disappearing_roundtrip() {
     let bob_proto = EcliptixProtocol::new(5).unwrap();
 
     let alice_group = alice_proto.create_group(b"alice".to_vec()).unwrap();
-    let (bob_kp, bob_x25519, bob_kyber) =
-        bob_proto.generate_key_package(b"bob".to_vec()).unwrap();
+    let (bob_kp, bob_x25519, bob_kyber) = bob_proto.generate_key_package(b"bob".to_vec()).unwrap();
 
     let (_commit, welcome) = alice_group.add_member(&bob_kp).unwrap();
-    let bob_group = bob_proto.join_group(&welcome, bob_x25519, bob_kyber).unwrap();
+    let bob_group = bob_proto
+        .join_group(&welcome, bob_x25519, bob_kyber)
+        .unwrap();
 
     let ct = alice_group
         .encrypt_disappearing(b"ephemeral", 3600)
@@ -494,7 +529,7 @@ fn api_group_join_external_invalid_state_fails() {
     init();
 
     let proto = EcliptixProtocol::new(0).unwrap();
-    let result = proto.join_group_external(b"garbage", b"cred".to_vec());
+    let result = proto.join_group_external(b"garbage", b"invalid-auth", b"cred".to_vec());
     assert!(result.is_err());
 }
 
@@ -552,10 +587,11 @@ fn api_group_edit_roundtrip() {
     let bob_proto = EcliptixProtocol::new(5).unwrap();
 
     let alice_group = alice_proto.create_group(b"alice".to_vec()).unwrap();
-    let (bob_kp, bob_x25519, bob_kyber) =
-        bob_proto.generate_key_package(b"bob".to_vec()).unwrap();
+    let (bob_kp, bob_x25519, bob_kyber) = bob_proto.generate_key_package(b"bob".to_vec()).unwrap();
     let (_commit, welcome) = alice_group.add_member(&bob_kp).unwrap();
-    let bob_group = bob_proto.join_group(&welcome, bob_x25519, bob_kyber).unwrap();
+    let bob_group = bob_proto
+        .join_group(&welcome, bob_x25519, bob_kyber)
+        .unwrap();
 
     let ct_original = alice_group.encrypt(b"original message").unwrap();
     let original_result = bob_group.decrypt(&ct_original).unwrap();
@@ -572,7 +608,10 @@ fn api_group_edit_roundtrip() {
         edit_result.content_type,
         ecliptix_protocol::protocol::group::ContentType::Edit
     );
-    assert_eq!(edit_result.referenced_message_id, original_result.message_id);
+    assert_eq!(
+        edit_result.referenced_message_id,
+        original_result.message_id
+    );
     assert!(!edit_result.message_id.is_empty());
     assert_ne!(edit_result.message_id, original_result.message_id);
 }
@@ -585,10 +624,11 @@ fn api_group_delete_roundtrip() {
     let bob_proto = EcliptixProtocol::new(5).unwrap();
 
     let alice_group = alice_proto.create_group(b"alice".to_vec()).unwrap();
-    let (bob_kp, bob_x25519, bob_kyber) =
-        bob_proto.generate_key_package(b"bob".to_vec()).unwrap();
+    let (bob_kp, bob_x25519, bob_kyber) = bob_proto.generate_key_package(b"bob".to_vec()).unwrap();
     let (_commit, welcome) = alice_group.add_member(&bob_kp).unwrap();
-    let bob_group = bob_proto.join_group(&welcome, bob_x25519, bob_kyber).unwrap();
+    let bob_group = bob_proto
+        .join_group(&welcome, bob_x25519, bob_kyber)
+        .unwrap();
 
     let ct_original = alice_group.encrypt(b"to be deleted").unwrap();
     let original_result = bob_group.decrypt(&ct_original).unwrap();
@@ -603,7 +643,10 @@ fn api_group_delete_roundtrip() {
         delete_result.content_type,
         ecliptix_protocol::protocol::group::ContentType::Delete
     );
-    assert_eq!(delete_result.referenced_message_id, original_result.message_id);
+    assert_eq!(
+        delete_result.referenced_message_id,
+        original_result.message_id
+    );
 }
 
 #[test]
@@ -642,10 +685,11 @@ fn api_group_normal_message_has_empty_referenced_id() {
     let bob_proto = EcliptixProtocol::new(5).unwrap();
 
     let alice_group = alice_proto.create_group(b"alice".to_vec()).unwrap();
-    let (bob_kp, bob_x25519, bob_kyber) =
-        bob_proto.generate_key_package(b"bob".to_vec()).unwrap();
+    let (bob_kp, bob_x25519, bob_kyber) = bob_proto.generate_key_package(b"bob".to_vec()).unwrap();
     let (_commit, welcome) = alice_group.add_member(&bob_kp).unwrap();
-    let bob_group = bob_proto.join_group(&welcome, bob_x25519, bob_kyber).unwrap();
+    let bob_group = bob_proto
+        .join_group(&welcome, bob_x25519, bob_kyber)
+        .unwrap();
 
     let ct = alice_group.encrypt(b"normal msg").unwrap();
     let result = bob_group.decrypt(&ct).unwrap();
@@ -665,10 +709,11 @@ fn api_group_decrypt_always_returns_message_id() {
     let bob_proto = EcliptixProtocol::new(5).unwrap();
 
     let alice_group = alice_proto.create_group(b"alice".to_vec()).unwrap();
-    let (bob_kp, bob_x25519, bob_kyber) =
-        bob_proto.generate_key_package(b"bob".to_vec()).unwrap();
+    let (bob_kp, bob_x25519, bob_kyber) = bob_proto.generate_key_package(b"bob".to_vec()).unwrap();
     let (_commit, welcome) = alice_group.add_member(&bob_kp).unwrap();
-    let bob_group = bob_proto.join_group(&welcome, bob_x25519, bob_kyber).unwrap();
+    let bob_group = bob_proto
+        .join_group(&welcome, bob_x25519, bob_kyber)
+        .unwrap();
 
     let mut seen_ids = std::collections::HashSet::new();
     for _ in 0..5 {
@@ -687,10 +732,11 @@ fn api_group_message_id_matches_compute() {
     let bob_proto = EcliptixProtocol::new(5).unwrap();
 
     let alice_group = alice_proto.create_group(b"alice".to_vec()).unwrap();
-    let (bob_kp, bob_x25519, bob_kyber) =
-        bob_proto.generate_key_package(b"bob".to_vec()).unwrap();
+    let (bob_kp, bob_x25519, bob_kyber) = bob_proto.generate_key_package(b"bob".to_vec()).unwrap();
     let (_commit, welcome) = alice_group.add_member(&bob_kp).unwrap();
-    let bob_group = bob_proto.join_group(&welcome, bob_x25519, bob_kyber).unwrap();
+    let bob_group = bob_proto
+        .join_group(&welcome, bob_x25519, bob_kyber)
+        .unwrap();
 
     let ct = alice_group.encrypt(b"test").unwrap();
     let result = bob_group.decrypt(&ct).unwrap();
@@ -730,8 +776,11 @@ fn shield_blocks_external_join() {
     let public_state = session.export_public_state().unwrap();
 
     let joiner = EcliptixProtocol::new(0).unwrap();
-    let result = joiner.join_group_external(&public_state, b"join".to_vec());
-    assert!(result.is_err(), "External join should be blocked by shield policy");
+    let result = joiner.join_group_external(&public_state, b"invalid-auth", b"join".to_vec());
+    assert!(
+        result.is_err(),
+        "External join should be blocked by shield policy"
+    );
 }
 
 #[test]
@@ -741,7 +790,9 @@ fn shield_forces_rotation() {
     let mut policy = GroupSecurityPolicy::shield();
     policy.max_messages_per_epoch = 10;
     policy.block_external_join = false;
-    let session = proto.create_group_with_policy(b"cred".to_vec(), policy).unwrap();
+    let session = proto
+        .create_group_with_policy(b"cred".to_vec(), policy)
+        .unwrap();
 
     for _ in 0..10 {
         session.encrypt(b"msg").unwrap();
@@ -757,7 +808,9 @@ fn shield_after_rotation_can_continue() {
     let mut policy = GroupSecurityPolicy::shield();
     policy.max_messages_per_epoch = 10;
     policy.block_external_join = false;
-    let session = proto.create_group_with_policy(b"cred".to_vec(), policy).unwrap();
+    let session = proto
+        .create_group_with_policy(b"cred".to_vec(), policy)
+        .unwrap();
 
     for _ in 0..10 {
         session.encrypt(b"msg").unwrap();
@@ -785,7 +838,9 @@ fn shield_policy_bound_in_context_hash() {
     init();
     let proto = EcliptixProtocol::new(0).unwrap();
 
-    let default_session = proto.create_group(b"cred".to_vec()).unwrap();
+    let default_session = proto
+        .create_group_with_policy(b"cred".to_vec(), permissive_group_policy())
+        .unwrap();
     let shield_session = proto.create_shielded_group(b"cred".to_vec()).unwrap();
 
     let default_policy = default_session.security_policy().unwrap();
@@ -803,8 +858,9 @@ fn shield_policy_survives_serialization() {
 
     let key = vec![0xABu8; 32];
     let data = session.serialize(&key, 42).unwrap();
-    let restored =
+    let (restored, restored_counter) =
         EcliptixGroupSession::deserialize(&data, &key, ed25519_sk, 0).unwrap();
+    assert_eq!(restored_counter, 42);
 
     assert!(restored.is_shielded().unwrap());
     let policy = restored.security_policy().unwrap();
@@ -831,14 +887,19 @@ fn shield_reduced_skip_window() {
     let (bob_kp_bytes, bob_x25519, bob_kyber) =
         bob_proto.generate_key_package(b"bob".to_vec()).unwrap();
     let (_commit, welcome) = alice_group.add_member(&bob_kp_bytes).unwrap();
-    let bob_group = bob_proto.join_group(&welcome, bob_x25519, bob_kyber).unwrap();
+    let bob_group = bob_proto
+        .join_group(&welcome, bob_x25519, bob_kyber)
+        .unwrap();
 
     for _ in 0..5 {
         alice_group.encrypt(b"skip me").unwrap();
     }
     let last_ct = alice_group.encrypt(b"catch this").unwrap();
     let result = bob_group.decrypt(&last_ct);
-    assert!(result.is_err(), "Should fail: too many skipped generations for shield policy");
+    assert!(
+        result.is_err(),
+        "Should fail: too many skipped generations for shield policy"
+    );
 }
 
 #[test]
@@ -847,12 +908,16 @@ fn shield_mandatory_franking() {
     let alice_proto = EcliptixProtocol::new(5).unwrap();
     let bob_proto = EcliptixProtocol::new(5).unwrap();
 
-    let alice_group = alice_proto.create_shielded_group(b"alice".to_vec()).unwrap();
+    let alice_group = alice_proto
+        .create_shielded_group(b"alice".to_vec())
+        .unwrap();
 
     let (bob_kp_bytes, bob_x25519, bob_kyber) =
         bob_proto.generate_key_package(b"bob".to_vec()).unwrap();
     let (_commit, welcome) = alice_group.add_member(&bob_kp_bytes).unwrap();
-    let bob_group = bob_proto.join_group(&welcome, bob_x25519, bob_kyber).unwrap();
+    let bob_group = bob_proto
+        .join_group(&welcome, bob_x25519, bob_kyber)
+        .unwrap();
 
     let ct = alice_group.encrypt(b"hello shield").unwrap();
     let result = bob_group.decrypt(&ct).unwrap();
@@ -864,17 +929,18 @@ fn shield_mandatory_franking() {
 }
 
 #[test]
-fn default_policy_unchanged() {
+fn hardened_default_policy_enabled() {
     init();
     let proto = EcliptixProtocol::new(0).unwrap();
     let session = proto.create_group(b"cred".to_vec()).unwrap();
-    assert!(!session.is_shielded().unwrap());
+    assert!(session.is_shielded().unwrap());
 
     let policy = session.security_policy().unwrap();
-    assert_eq!(policy.max_messages_per_epoch, 0);
-    assert!(!policy.enhanced_key_schedule);
-    assert!(!policy.mandatory_franking);
-    assert!(!policy.block_external_join);
+    assert_eq!(policy.max_messages_per_epoch, 1_000);
+    assert_eq!(policy.max_skipped_keys_per_sender, 4);
+    assert!(policy.enhanced_key_schedule);
+    assert!(policy.mandatory_franking);
+    assert!(policy.block_external_join);
 }
 
 #[test]
@@ -883,12 +949,16 @@ fn shield_welcome_carries_policy() {
     let alice_proto = EcliptixProtocol::new(5).unwrap();
     let bob_proto = EcliptixProtocol::new(5).unwrap();
 
-    let alice_group = alice_proto.create_shielded_group(b"alice".to_vec()).unwrap();
+    let alice_group = alice_proto
+        .create_shielded_group(b"alice".to_vec())
+        .unwrap();
 
     let (bob_kp_bytes, bob_x25519, bob_kyber) =
         bob_proto.generate_key_package(b"bob".to_vec()).unwrap();
     let (_commit, welcome) = alice_group.add_member(&bob_kp_bytes).unwrap();
-    let bob_group = bob_proto.join_group(&welcome, bob_x25519, bob_kyber).unwrap();
+    let bob_group = bob_proto
+        .join_group(&welcome, bob_x25519, bob_kyber)
+        .unwrap();
 
     assert!(bob_group.is_shielded().unwrap());
     let bob_policy = bob_group.security_policy().unwrap();

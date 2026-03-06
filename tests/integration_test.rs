@@ -17,6 +17,77 @@ fn init() {
     CryptoInterop::initialize().expect("crypto init");
 }
 
+const fn external_join_enabled_policy() -> ecliptix_protocol::protocol::group::GroupSecurityPolicy {
+    let mut policy = ecliptix_protocol::protocol::group::GroupSecurityPolicy::shield();
+    policy.block_external_join = false;
+    policy
+}
+
+fn create_external_joinable_group(
+    identity: &IdentityKeys,
+    credential: &[u8],
+) -> ecliptix_protocol::protocol::group::GroupSession {
+    ecliptix_protocol::protocol::group::GroupSession::create_with_policy(
+        identity,
+        credential.to_vec(),
+        external_join_enabled_policy(),
+    )
+    .unwrap()
+}
+
+fn create_two_member_group_with_policy(
+    policy: ecliptix_protocol::protocol::group::GroupSecurityPolicy,
+) -> (GroupSession, GroupSession) {
+    let alice_id = IdentityKeys::create(10).unwrap();
+    let bob_id = IdentityKeys::create(10).unwrap();
+
+    let alice_session =
+        GroupSession::create_with_policy(&alice_id, b"alice".to_vec(), policy).unwrap();
+    let (bob_kp, bob_x25519_priv, bob_kyber_sec) =
+        group::key_package::create_key_package(&bob_id, b"bob".to_vec()).unwrap();
+    let (_commit, welcome) = alice_session.add_member(&bob_kp).unwrap();
+
+    let bob_session = GroupSession::from_welcome(
+        &welcome,
+        bob_x25519_priv,
+        bob_kyber_sec,
+        &bob_id.get_identity_ed25519_public(),
+        &bob_id.get_identity_x25519_public(),
+        bob_id.get_identity_ed25519_private_key_copy().unwrap(),
+    )
+    .unwrap();
+
+    (alice_session, bob_session)
+}
+
+fn create_two_member_group() -> (GroupSession, GroupSession) {
+    create_two_member_group_with_policy(
+        ecliptix_protocol::protocol::group::GroupSecurityPolicy::shield(),
+    )
+}
+
+fn authorize_and_join_external(
+    owner: &ecliptix_protocol::protocol::group::GroupSession,
+    joiner: &IdentityKeys,
+    credential: &[u8],
+) -> (ecliptix_protocol::protocol::group::GroupSession, Vec<u8>) {
+    let authorization = owner
+        .authorize_external_join(
+            &joiner.get_identity_ed25519_public(),
+            &joiner.get_identity_x25519_public(),
+            credential,
+        )
+        .unwrap();
+    let public_state = owner.export_public_state().unwrap();
+    ecliptix_protocol::protocol::group::GroupSession::from_external_join(
+        &public_state,
+        &authorization,
+        joiner,
+        credential.to_vec(),
+    )
+    .unwrap()
+}
+
 #[test]
 fn crypto_initialize_is_idempotent() {
     init();
@@ -3503,6 +3574,7 @@ fn group_tree_new_single_and_add_leaf() {
         kp.identity_ed25519_public.clone(),
         kp.identity_x25519_public,
         b"alice".to_vec(),
+        kp.signature,
     )
     .unwrap();
 
@@ -3521,6 +3593,7 @@ fn group_tree_new_single_and_add_leaf() {
                 credential: b"bob".to_vec(),
                 identity_ed25519_public: kp2.identity_ed25519_public.clone(),
                 identity_x25519_public: kp2.identity_x25519_public,
+                signature: kp2.signature,
             },
         )
         .unwrap();
@@ -3546,6 +3619,7 @@ fn group_tree_blank_and_refill() {
         kp.identity_ed25519_public.clone(),
         kp.identity_x25519_public,
         b"alice".to_vec(),
+        kp.signature,
     )
     .unwrap();
 
@@ -3558,6 +3632,7 @@ fn group_tree_blank_and_refill() {
             credential: b"bob".to_vec(),
             identity_ed25519_public: kp2.identity_ed25519_public.clone(),
             identity_x25519_public: kp2.identity_x25519_public,
+            signature: kp2.signature,
         },
     )
     .unwrap();
@@ -3572,6 +3647,7 @@ fn group_tree_blank_and_refill() {
             credential: b"carol".to_vec(),
             identity_ed25519_public: kp3.identity_ed25519_public.clone(),
             identity_x25519_public: kp3.identity_x25519_public,
+            signature: kp3.signature,
         },
     )
     .unwrap();
@@ -3591,6 +3667,7 @@ fn group_tree_blank_and_refill() {
                 credential: b"dave".to_vec(),
                 identity_ed25519_public: kp4.identity_ed25519_public.clone(),
                 identity_x25519_public: kp4.identity_x25519_public,
+                signature: kp4.signature,
             },
         )
         .unwrap();
@@ -3615,6 +3692,7 @@ fn group_tree_hash_deterministic() {
         kp.identity_ed25519_public.clone(),
         kp.identity_x25519_public,
         b"alice".to_vec(),
+        kp.signature,
     )
     .unwrap();
 
@@ -3640,6 +3718,7 @@ fn group_tree_serialization_roundtrip() {
         kp.identity_ed25519_public.clone(),
         kp.identity_x25519_public,
         b"alice".to_vec(),
+        kp.signature,
     )
     .unwrap();
 
@@ -3705,10 +3784,12 @@ fn group_key_schedule_deterministic() {
     let commit_secret = vec![1u8; 32];
     let ctx_hash = vec![2u8; 32];
 
-    let keys1 = group::GroupKeySchedule::derive_epoch_keys(&init_secret, &commit_secret, &ctx_hash, false)
-        .unwrap();
-    let keys2 = group::GroupKeySchedule::derive_epoch_keys(&init_secret, &commit_secret, &ctx_hash, false)
-        .unwrap();
+    let keys1 =
+        group::GroupKeySchedule::derive_epoch_keys(&init_secret, &commit_secret, &ctx_hash, false)
+            .unwrap();
+    let keys2 =
+        group::GroupKeySchedule::derive_epoch_keys(&init_secret, &commit_secret, &ctx_hash, false)
+            .unwrap();
 
     assert_eq!(keys1.epoch_secret, keys2.epoch_secret);
     assert_eq!(keys1.metadata_key, keys2.metadata_key);
@@ -3725,8 +3806,9 @@ fn group_key_schedule_domain_separation() {
     let commit_secret = vec![1u8; 32];
     let ctx_hash = vec![2u8; 32];
 
-    let keys = group::GroupKeySchedule::derive_epoch_keys(&init_secret, &commit_secret, &ctx_hash, false)
-        .unwrap();
+    let keys =
+        group::GroupKeySchedule::derive_epoch_keys(&init_secret, &commit_secret, &ctx_hash, false)
+            .unwrap();
 
     assert_ne!(keys.epoch_secret, keys.metadata_key);
     assert_ne!(keys.metadata_key, keys.welcome_key);
@@ -3745,9 +3827,11 @@ fn group_key_schedule_different_inputs_different_outputs() {
     let ctx_hash = vec![3u8; 32];
 
     let keys1 =
-        group::GroupKeySchedule::derive_epoch_keys(&init_secret, &commit1, &ctx_hash, false).unwrap();
+        group::GroupKeySchedule::derive_epoch_keys(&init_secret, &commit1, &ctx_hash, false)
+            .unwrap();
     let keys2 =
-        group::GroupKeySchedule::derive_epoch_keys(&init_secret, &commit2, &ctx_hash, false).unwrap();
+        group::GroupKeySchedule::derive_epoch_keys(&init_secret, &commit2, &ctx_hash, false)
+            .unwrap();
 
     assert_ne!(keys1.epoch_secret, keys2.epoch_secret);
 }
@@ -4239,9 +4323,10 @@ fn group_api_serialize_deserialize() {
     let key = vec![0x77u8; 32];
     let sealed = session.serialize(&key, 1).unwrap();
 
-    let restored =
+    let (restored, restored_counter) =
         ecliptix_protocol::api::EcliptixGroupSession::deserialize(&sealed, &key, ed25519_secret, 0)
             .unwrap();
+    assert_eq!(restored_counter, 1);
     assert_eq!(session.group_id().unwrap(), restored.group_id().unwrap());
     assert_eq!(session.epoch().unwrap(), restored.epoch().unwrap());
 }
@@ -4253,7 +4338,7 @@ fn group_two_member_add_welcome_roundtrip() {
     let alice_id = IdentityKeys::create(10).unwrap();
     let bob_id = IdentityKeys::create(20).unwrap();
 
-    let alice_session = GroupSession::create(&alice_id, b"alice".to_vec()).unwrap();
+    let alice_session = create_external_joinable_group(&alice_id, b"alice");
     assert_eq!(alice_session.epoch().unwrap(), 0);
     assert_eq!(alice_session.member_count().unwrap(), 1);
     assert_eq!(alice_session.my_leaf_index().unwrap(), 0);
@@ -4293,7 +4378,7 @@ fn group_two_member_encrypt_decrypt() {
     let alice_id = IdentityKeys::create(10).unwrap();
     let bob_id = IdentityKeys::create(20).unwrap();
 
-    let alice_session = GroupSession::create(&alice_id, b"alice".to_vec()).unwrap();
+    let alice_session = create_external_joinable_group(&alice_id, b"alice");
 
     let (bob_kp, bob_x25519_priv, bob_kyber_sec) =
         group::key_package::create_key_package(&bob_id, b"bob".to_vec()).unwrap();
@@ -4336,7 +4421,7 @@ fn group_three_member_messaging() {
     let bob_id = IdentityKeys::create(20).unwrap();
     let carol_id = IdentityKeys::create(30).unwrap();
 
-    let alice_session = GroupSession::create(&alice_id, b"alice".to_vec()).unwrap();
+    let alice_session = create_external_joinable_group(&alice_id, b"alice");
 
     let (bob_kp, bob_x25519_priv, bob_kyber_sec) =
         group::key_package::create_key_package(&bob_id, b"bob".to_vec()).unwrap();
@@ -4403,7 +4488,7 @@ fn group_remove_member_blocks_decryption() {
     let alice_id = IdentityKeys::create(10).unwrap();
     let bob_id = IdentityKeys::create(20).unwrap();
 
-    let alice_session = GroupSession::create(&alice_id, b"alice".to_vec()).unwrap();
+    let alice_session = create_external_joinable_group(&alice_id, b"alice");
 
     let (bob_kp, bob_x25519_priv, bob_kyber_sec) =
         group::key_package::create_key_package(&bob_id, b"bob".to_vec()).unwrap();
@@ -4440,7 +4525,7 @@ fn group_update_both_members_advance() {
     let alice_id = IdentityKeys::create(10).unwrap();
     let bob_id = IdentityKeys::create(20).unwrap();
 
-    let alice_session = GroupSession::create(&alice_id, b"alice".to_vec()).unwrap();
+    let alice_session = create_external_joinable_group(&alice_id, b"alice");
 
     let (bob_kp, bob_x25519_priv, bob_kyber_sec) =
         group::key_package::create_key_package(&bob_id, b"bob".to_vec()).unwrap();
@@ -4650,14 +4735,12 @@ fn group_external_join_basic() {
     init();
 
     let alice_id = IdentityKeys::create(10).unwrap();
-    let alice_session = GroupSession::create(&alice_id, b"alice".to_vec()).unwrap();
+    let alice_session = create_external_joinable_group(&alice_id, b"alice");
     assert_eq!(alice_session.member_count().unwrap(), 1);
-
-    let public_state = alice_session.export_public_state().unwrap();
 
     let bob_id = IdentityKeys::create(20).unwrap();
     let (bob_session, external_commit) =
-        GroupSession::from_external_join(&public_state, &bob_id, b"bob".to_vec()).unwrap();
+        authorize_and_join_external(&alice_session, &bob_id, b"bob");
 
     alice_session.process_commit(&external_commit).unwrap();
 
@@ -4679,7 +4762,7 @@ fn group_external_join_three_members() {
     init();
 
     let alice_id = IdentityKeys::create(10).unwrap();
-    let alice_session = GroupSession::create(&alice_id, b"alice".to_vec()).unwrap();
+    let alice_session = create_external_joinable_group(&alice_id, b"alice");
 
     let bob_id = IdentityKeys::create(20).unwrap();
     let (bob_kp, bob_x25519_priv, bob_kyber_sec) =
@@ -4696,10 +4779,9 @@ fn group_external_join_three_members() {
     )
     .unwrap();
 
-    let public_state = alice_session.export_public_state().unwrap();
     let carol_id = IdentityKeys::create(30).unwrap();
     let (carol_session, external_commit) =
-        GroupSession::from_external_join(&public_state, &carol_id, b"carol".to_vec()).unwrap();
+        authorize_and_join_external(&alice_session, &carol_id, b"carol");
 
     alice_session.process_commit(&external_commit).unwrap();
     bob_session.process_commit(&external_commit).unwrap();
@@ -4730,12 +4812,11 @@ fn group_external_join_oversized_committer_index_rejected_without_panic() {
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
     let alice_id = IdentityKeys::create(10).unwrap();
-    let alice_session = GroupSession::create(&alice_id, b"alice".to_vec()).unwrap();
+    let alice_session = create_external_joinable_group(&alice_id, b"alice");
 
-    let public_state = alice_session.export_public_state().unwrap();
     let joiner_id = IdentityKeys::create(10).unwrap();
     let (_joiner_session, ext_commit_bytes) =
-        GroupSession::from_external_join(&public_state, &joiner_id, b"joiner".to_vec()).unwrap();
+        authorize_and_join_external(&alice_session, &joiner_id, b"joiner");
 
     let mut commit =
         ecliptix_protocol::proto::GroupCommit::decode(ext_commit_bytes.as_slice()).unwrap();
@@ -4771,7 +4852,7 @@ fn group_external_join_wrong_public_state_fails() {
     init();
 
     let alice_id = IdentityKeys::create(10).unwrap();
-    let alice_session = GroupSession::create(&alice_id, b"alice".to_vec()).unwrap();
+    let alice_session = create_external_joinable_group(&alice_id, b"alice");
 
     let mut public_state = alice_session.export_public_state().unwrap();
 
@@ -4780,7 +4861,15 @@ fn group_external_join_wrong_public_state_fails() {
     }
 
     let bob_id = IdentityKeys::create(20).unwrap();
-    let result = GroupSession::from_external_join(&public_state, &bob_id, b"bob".to_vec());
+    let authorization = alice_session
+        .authorize_external_join(
+            &bob_id.get_identity_ed25519_public(),
+            &bob_id.get_identity_x25519_public(),
+            b"bob",
+        )
+        .unwrap();
+    let result =
+        GroupSession::from_external_join(&public_state, &authorization, &bob_id, b"bob".to_vec());
     assert!(result.is_err(), "Tampered public state should be rejected");
 }
 
@@ -4802,6 +4891,7 @@ fn group_tree_max_members() {
         kp.identity_ed25519_public.clone(),
         kp.identity_x25519_public,
         b"first".to_vec(),
+        kp.signature,
     )
     .unwrap();
 
@@ -4814,6 +4904,7 @@ fn group_tree_max_members() {
             credential: mkp.credential.clone(),
             identity_ed25519_public: mkp.identity_ed25519_public.clone(),
             identity_x25519_public: mkp.identity_x25519_public.clone(),
+            signature: mkp.signature.clone(),
         };
         tree.add_leaf(
             mkp.leaf_x25519_public.clone(),
@@ -4832,6 +4923,7 @@ fn group_tree_max_members() {
         credential: extra_kp.credential.clone(),
         identity_ed25519_public: extra_kp.identity_ed25519_public.clone(),
         identity_x25519_public: extra_kp.identity_x25519_public.clone(),
+        signature: extra_kp.signature.clone(),
     };
     let result = tree.add_leaf(
         extra_kp.leaf_x25519_public.clone(),
@@ -4961,28 +5053,6 @@ fn group_proptest_encrypt_decrypt_roundtrip() {
         .unwrap();
 }
 
-fn create_two_member_group() -> (GroupSession, GroupSession) {
-    let alice_id = IdentityKeys::create(10).unwrap();
-    let bob_id = IdentityKeys::create(10).unwrap();
-
-    let alice_session = GroupSession::create(&alice_id, b"alice".to_vec()).unwrap();
-    let (bob_kp, bob_x25519_priv, bob_kyber_sec) =
-        group::key_package::create_key_package(&bob_id, b"bob".to_vec()).unwrap();
-    let (_commit, welcome) = alice_session.add_member(&bob_kp).unwrap();
-
-    let bob_session = GroupSession::from_welcome(
-        &welcome,
-        bob_x25519_priv,
-        bob_kyber_sec,
-        &bob_id.get_identity_ed25519_public(),
-        &bob_id.get_identity_x25519_public(),
-        bob_id.get_identity_ed25519_private_key_copy().unwrap(),
-    )
-    .unwrap();
-
-    (alice_session, bob_session)
-}
-
 #[allow(dead_code)]
 fn add_member_to_group(
     adder_session: &GroupSession,
@@ -5013,7 +5083,7 @@ fn group_cascading_removes() {
     init();
 
     let alice_id = IdentityKeys::create(10).unwrap();
-    let alice = GroupSession::create(&alice_id, b"alice".to_vec()).unwrap();
+    let alice = create_external_joinable_group(&alice_id, b"alice");
 
     let mut others = Vec::new();
     for i in 0..5 {
@@ -5063,7 +5133,7 @@ fn group_cascading_removes() {
 fn group_readd_removed_member() {
     init();
 
-    let (alice, bob) = create_two_member_group();
+    let (alice, bob) = create_two_member_group_with_policy(external_join_enabled_policy());
     let bob_leaf = bob.my_leaf_index().unwrap();
 
     let _commit = alice.remove_member(bob_leaf).unwrap();
@@ -5101,7 +5171,7 @@ fn group_state_persistence_across_epochs() {
 
     let alice_id = IdentityKeys::create(10).unwrap();
     let bob_id = IdentityKeys::create(10).unwrap();
-    let alice = GroupSession::create(&alice_id, b"alice".to_vec()).unwrap();
+    let alice = create_external_joinable_group(&alice_id, b"alice");
     let (bob_kp, bob_x, bob_k) =
         group::key_package::create_key_package(&bob_id, b"bob".to_vec()).unwrap();
     let (_commit, welcome) = alice.add_member(&bob_kp).unwrap();
@@ -5157,7 +5227,7 @@ fn group_five_member_messaging() {
     init();
 
     let alice_id = IdentityKeys::create(10).unwrap();
-    let alice = GroupSession::create(&alice_id, b"alice".to_vec()).unwrap();
+    let alice = create_external_joinable_group(&alice_id, b"alice");
 
     let mut members = vec![];
     for i in 0..4 {
@@ -5205,7 +5275,9 @@ fn group_five_member_messaging() {
 fn group_update_both_members_bidirectional() {
     init();
 
-    let (alice, bob) = create_two_member_group();
+    let mut policy = ecliptix_protocol::protocol::group::GroupSecurityPolicy::shield();
+    policy.max_skipped_keys_per_sender = 32;
+    let (alice, bob) = create_two_member_group_with_policy(policy);
 
     let commit1 = alice.update().unwrap();
     bob.process_commit(&commit1).unwrap();
@@ -5230,7 +5302,7 @@ fn group_update_both_members_bidirectional() {
 fn group_rapid_epoch_advancement() {
     init();
 
-    let (alice, bob) = create_two_member_group();
+    let (alice, bob) = create_two_member_group_with_policy(external_join_enabled_policy());
 
     for i in 0..50 {
         if i % 2 == 0 {
@@ -5482,6 +5554,7 @@ fn group_psk_commit_derives_epoch_keys_from_psk_and_requires_resolver() {
         alice_kp.identity_ed25519_public.clone(),
         alice_kp.identity_x25519_public.clone(),
         alice_kp.credential,
+        alice_kp.signature,
     )
     .unwrap();
 
@@ -5493,6 +5566,7 @@ fn group_psk_commit_derives_epoch_keys_from_psk_and_requires_resolver() {
                 credential: bob_kp.credential.clone(),
                 identity_ed25519_public: bob_kp.identity_ed25519_public.clone(),
                 identity_x25519_public: bob_kp.identity_x25519_public,
+                signature: bob_kp.signature,
             },
         )
         .unwrap();
@@ -5632,7 +5706,7 @@ fn group_new_member_cannot_decrypt_pre_join_messages() {
     let bob_id = IdentityKeys::create(10).unwrap();
     let carol_id = IdentityKeys::create(10).unwrap();
 
-    let alice = GroupSession::create(&alice_id, b"alice".to_vec()).unwrap();
+    let alice = create_external_joinable_group(&alice_id, b"alice");
     let (bob_kp, bob_x, bob_k) =
         group::key_package::create_key_package(&bob_id, b"bob".to_vec()).unwrap();
     let (_c1, w1) = alice.add_member(&bob_kp).unwrap();
@@ -5693,7 +5767,7 @@ fn group_new_member_cannot_decrypt_multi_epoch_history() {
     let alice_id = IdentityKeys::create(10).unwrap();
     let bob_id = IdentityKeys::create(10).unwrap();
 
-    let alice = GroupSession::create(&alice_id, b"alice".to_vec()).unwrap();
+    let alice = create_external_joinable_group(&alice_id, b"alice");
     let (bob_kp, bob_x, bob_k) =
         group::key_package::create_key_package(&bob_id, b"bob".to_vec()).unwrap();
     let (_c1, w1) = alice.add_member(&bob_kp).unwrap();
@@ -5758,7 +5832,7 @@ fn group_removed_member_forward_secrecy_across_rotations() {
     let bob_id = IdentityKeys::create(10).unwrap();
     let carol_id = IdentityKeys::create(10).unwrap();
 
-    let alice = GroupSession::create(&alice_id, b"alice".to_vec()).unwrap();
+    let alice = create_external_joinable_group(&alice_id, b"alice");
 
     let (bob_kp, bob_x, bob_k) =
         group::key_package::create_key_package(&bob_id, b"bob".to_vec()).unwrap();
@@ -5822,7 +5896,7 @@ fn group_readd_member_cannot_decrypt_gap_messages() {
     let alice_id = IdentityKeys::create(10).unwrap();
     let bob_id = IdentityKeys::create(10).unwrap();
 
-    let alice = GroupSession::create(&alice_id, b"alice".to_vec()).unwrap();
+    let alice = create_external_joinable_group(&alice_id, b"alice");
     let (bob_kp, bob_x, bob_k) =
         group::key_package::create_key_package(&bob_id, b"bob".to_vec()).unwrap();
     let (_c1, w1) = alice.add_member(&bob_kp).unwrap();
@@ -5884,7 +5958,7 @@ fn group_external_join_cannot_decrypt_pre_join_messages() {
     let alice_id = IdentityKeys::create(10).unwrap();
     let bob_id = IdentityKeys::create(10).unwrap();
 
-    let alice = GroupSession::create(&alice_id, b"alice".to_vec()).unwrap();
+    let alice = create_external_joinable_group(&alice_id, b"alice");
     let (bob_kp, bob_x, bob_k) =
         group::key_package::create_key_package(&bob_id, b"bob".to_vec()).unwrap();
     let (_c1, w1) = alice.add_member(&bob_kp).unwrap();
@@ -5903,10 +5977,8 @@ fn group_external_join_cannot_decrypt_pre_join_messages() {
     bob.decrypt(&ct_old_a).unwrap();
     alice.decrypt(&ct_old_b).unwrap();
 
-    let public_state = alice.export_public_state().unwrap();
     let carol_id = IdentityKeys::create(10).unwrap();
-    let (carol, ext_commit) =
-        GroupSession::from_external_join(&public_state, &carol_id, b"carol".to_vec()).unwrap();
+    let (carol, ext_commit) = authorize_and_join_external(&alice, &carol_id, b"carol");
     alice.process_commit(&ext_commit).unwrap();
     bob.process_commit(&ext_commit).unwrap();
 
@@ -5928,7 +6000,7 @@ fn group_external_join_cannot_decrypt_pre_join_messages() {
 fn group_stress_100_messages_bidirectional() {
     init();
 
-    let (alice, bob) = create_two_member_group();
+    let (alice, bob) = create_two_member_group_with_policy(external_join_enabled_policy());
 
     for i in 0..100u32 {
         if i % 2 == 0 {
@@ -5951,24 +6023,29 @@ fn group_concurrent_encrypt_decrypt() {
 
     let (alice, bob) = create_two_member_group();
     let alice = Arc::new(alice);
-    let bob = Arc::new(bob);
+    let results = Arc::new(std::sync::Mutex::new(Vec::<(Vec<u8>, Vec<u8>)>::new()));
 
     let mut handles = vec![];
     for t in 0..8u32 {
         let alice = Arc::clone(&alice);
-        let bob = Arc::clone(&bob);
+        let results = Arc::clone(&results);
         handles.push(thread::spawn(move || {
             for i in 0..50u32 {
                 let msg = format!("t{t}-m{i}");
                 let ct = alice.encrypt(msg.as_bytes()).unwrap();
-                let pt = bob.decrypt(&ct).unwrap();
-                assert_eq!(pt.plaintext, msg.as_bytes());
+                results.lock().unwrap().push((msg.into_bytes(), ct));
             }
         }));
     }
 
     for h in handles {
         h.join().expect("thread panicked");
+    }
+
+    let mut produced = results.lock().unwrap();
+    for (msg, ct) in produced.drain(..) {
+        let pt = bob.decrypt(&ct).unwrap();
+        assert_eq!(pt.plaintext, msg);
     }
 }
 
@@ -5988,6 +6065,7 @@ fn group_psk_proposal_validation() {
         kp.identity_ed25519_public.clone(),
         kp.identity_x25519_public,
         b"alice".to_vec(),
+        kp.signature,
     )
     .unwrap();
 
@@ -6038,6 +6116,7 @@ fn group_reinit_proposal_validation() {
         kp.identity_ed25519_public.clone(),
         kp.identity_x25519_public,
         b"alice".to_vec(),
+        kp.signature,
     )
     .unwrap();
 
@@ -6075,7 +6154,7 @@ fn group_plaintext_roundtrip_regression() {
     assert_eq!(result.plaintext, plaintext);
     assert_eq!(result.content_type, ContentType::Normal);
     assert!(result.sealed_payload.is_none());
-    assert!(result.franking_data.is_none());
+    assert!(result.franking_data.is_some());
     assert_eq!(result.ttl_seconds, 0);
 }
 
@@ -6083,7 +6162,9 @@ fn group_plaintext_roundtrip_regression() {
 fn group_sealed_message_roundtrip() {
     use ecliptix_protocol::protocol::group::{ContentType, GroupSession};
 
-    let (alice, bob) = create_two_member_group();
+    let mut policy = ecliptix_protocol::protocol::group::GroupSecurityPolicy::shield();
+    policy.max_messages_per_epoch = 5_000;
+    let (alice, bob) = create_two_member_group_with_policy(policy);
     let actual_content = b"This is top-secret content";
     let hint = b"Photo from Alice";
 
@@ -6271,7 +6352,7 @@ fn group_add_reuses_blank_slot_after_remove() {
     let bob_id = IdentityKeys::create(10).unwrap();
     let carol_id = IdentityKeys::create(10).unwrap();
 
-    let alice = GroupSession::create(&alice_id, b"alice".to_vec()).unwrap();
+    let alice = create_external_joinable_group(&alice_id, b"alice");
 
     let (bob_kp, bob_x, bob_k) =
         group::key_package::create_key_package(&bob_id, b"bob".to_vec()).unwrap();
@@ -6331,7 +6412,7 @@ fn group_remove_self_rejected() {
 fn group_decrypt_result_metadata_correct() {
     init();
 
-    let (alice, bob) = create_two_member_group();
+    let (alice, bob) = create_two_member_group_with_policy(external_join_enabled_policy());
 
     for i in 0..5u32 {
         let ct = alice.encrypt(format!("msg-{i}").as_bytes()).unwrap();
@@ -6371,7 +6452,7 @@ fn group_state_persistence_then_add_member() {
 
     let alice_id = IdentityKeys::create(10).unwrap();
     let bob_id = IdentityKeys::create(10).unwrap();
-    let alice = GroupSession::create(&alice_id, b"alice".to_vec()).unwrap();
+    let alice = create_external_joinable_group(&alice_id, b"alice");
     let (bob_kp, bob_x, bob_k) =
         group::key_package::create_key_package(&bob_id, b"bob".to_vec()).unwrap();
     let (_commit, welcome) = alice.add_member(&bob_kp).unwrap();
@@ -6465,7 +6546,7 @@ fn group_external_join_after_remove() {
     let alice_id = IdentityKeys::create(10).unwrap();
     let bob_id = IdentityKeys::create(10).unwrap();
 
-    let alice = GroupSession::create(&alice_id, b"alice".to_vec()).unwrap();
+    let alice = create_external_joinable_group(&alice_id, b"alice");
     let (bob_kp, bob_x, bob_k) =
         group::key_package::create_key_package(&bob_id, b"bob".to_vec()).unwrap();
     let (_c1, w1) = alice.add_member(&bob_kp).unwrap();
@@ -6482,10 +6563,8 @@ fn group_external_join_after_remove() {
     let _remove_commit = alice.remove_member(bob.my_leaf_index().unwrap()).unwrap();
     assert_eq!(alice.member_count().unwrap(), 1);
 
-    let public_state = alice.export_public_state().unwrap();
     let carol_id = IdentityKeys::create(10).unwrap();
-    let (carol, ext_commit) =
-        GroupSession::from_external_join(&public_state, &carol_id, b"carol".to_vec()).unwrap();
+    let (carol, ext_commit) = authorize_and_join_external(&alice, &carol_id, b"carol");
     alice.process_commit(&ext_commit).unwrap();
 
     assert_eq!(alice.member_count().unwrap(), 2);
@@ -6500,7 +6579,9 @@ fn group_external_join_after_remove() {
 fn group_replay_detection_capacity_eviction() {
     init();
 
-    let (alice, bob) = create_two_member_group();
+    let mut policy = ecliptix_protocol::protocol::group::GroupSecurityPolicy::shield();
+    policy.max_messages_per_epoch = 5_000;
+    let (alice, bob) = create_two_member_group_with_policy(policy);
 
     for i in 0u32..2100 {
         let ct = alice.encrypt(format!("m{i}").as_bytes()).unwrap();
@@ -6520,7 +6601,7 @@ fn group_multi_sender_generation_counters() {
     let bob_id = IdentityKeys::create(10).unwrap();
     let carol_id = IdentityKeys::create(10).unwrap();
 
-    let alice = GroupSession::create(&alice_id, b"alice".to_vec()).unwrap();
+    let alice = create_external_joinable_group(&alice_id, b"alice");
     let (bob_kp, bob_x, bob_k) =
         group::key_package::create_key_package(&bob_id, b"bob".to_vec()).unwrap();
     let (_c1, w1) = alice.add_member(&bob_kp).unwrap();
@@ -6708,7 +6789,7 @@ fn group_member_leaf_indices_consistent() {
     let bob_id = IdentityKeys::create(10).unwrap();
     let carol_id = IdentityKeys::create(10).unwrap();
 
-    let alice = GroupSession::create(&alice_id, b"alice".to_vec()).unwrap();
+    let alice = create_external_joinable_group(&alice_id, b"alice");
 
     let (bob_kp, bob_x, bob_k) =
         group::key_package::create_key_package(&bob_id, b"bob".to_vec()).unwrap();
@@ -6823,7 +6904,7 @@ fn group_complex_lifecycle_add_update_remove_messaging() {
 fn group_id_immutable_across_lifecycle() {
     init();
 
-    let (alice, bob) = create_two_member_group();
+    let (alice, bob) = create_two_member_group_with_policy(external_join_enabled_policy());
     let group_id = alice.group_id().unwrap();
 
     assert_eq!(group_id.len(), 32);
@@ -6853,10 +6934,8 @@ fn group_id_immutable_across_lifecycle() {
     assert_eq!(bob.group_id().unwrap(), group_id);
     assert_eq!(carol.group_id().unwrap(), group_id);
 
-    let public_state = alice.export_public_state().unwrap();
     let dave_id = IdentityKeys::create(10).unwrap();
-    let (dave, ext_commit) =
-        GroupSession::from_external_join(&public_state, &dave_id, b"dave".to_vec()).unwrap();
+    let (dave, ext_commit) = authorize_and_join_external(&alice, &dave_id, b"dave");
     alice.process_commit(&ext_commit).unwrap();
     bob.process_commit(&ext_commit).unwrap();
     carol.process_commit(&ext_commit).unwrap();
@@ -7006,7 +7085,7 @@ fn group_external_join_after_many_epochs() {
     init();
 
     let alice_id = IdentityKeys::create(10).unwrap();
-    let alice = GroupSession::create(&alice_id, b"alice".to_vec()).unwrap();
+    let alice = create_external_joinable_group(&alice_id, b"alice");
 
     for _ in 0..10 {
         let _commit = alice.update().unwrap();
@@ -7014,10 +7093,8 @@ fn group_external_join_after_many_epochs() {
 
     assert_eq!(alice.epoch().unwrap(), 10);
 
-    let public_state = alice.export_public_state().unwrap();
     let joiner_id = IdentityKeys::create(10).unwrap();
-    let (joiner, ext_commit) =
-        GroupSession::from_external_join(&public_state, &joiner_id, b"joiner".to_vec()).unwrap();
+    let (joiner, ext_commit) = authorize_and_join_external(&alice, &joiner_id, b"joiner");
     alice.process_commit(&ext_commit).unwrap();
 
     assert_eq!(alice.epoch().unwrap(), 11);
@@ -7038,19 +7115,15 @@ fn group_sequential_external_joins() {
     init();
 
     let alice_id = IdentityKeys::create(10).unwrap();
-    let alice = GroupSession::create(&alice_id, b"alice".to_vec()).unwrap();
+    let alice = create_external_joinable_group(&alice_id, b"alice");
 
     let mut joiners: Vec<GroupSession> = Vec::new();
 
     for i in 0..3 {
-        let public_state = alice.export_public_state().unwrap();
         let joiner_id = IdentityKeys::create(10).unwrap();
-        let (joiner, ext_commit) = GroupSession::from_external_join(
-            &public_state,
-            &joiner_id,
-            format!("ext{i}").into_bytes(),
-        )
-        .unwrap();
+        let joiner_credential = format!("ext{i}").into_bytes();
+        let (joiner, ext_commit) =
+            authorize_and_join_external(&alice, &joiner_id, &joiner_credential);
 
         alice.process_commit(&ext_commit).unwrap();
         for s in &joiners {
@@ -7085,7 +7158,7 @@ fn group_welcome_truncated_rejected() {
     init();
 
     let alice_id = IdentityKeys::create(10).unwrap();
-    let alice = GroupSession::create(&alice_id, b"alice".to_vec()).unwrap();
+    let alice = create_external_joinable_group(&alice_id, b"alice");
 
     let bob_id = IdentityKeys::create(10).unwrap();
     let (bob_kp, _bob_x, _bob_k) =
@@ -7729,12 +7802,10 @@ fn group_external_join_then_immediate_update() {
     init();
 
     let alice_id = IdentityKeys::create(10).unwrap();
-    let alice = GroupSession::create(&alice_id, b"alice".to_vec()).unwrap();
+    let alice = create_external_joinable_group(&alice_id, b"alice");
 
-    let public_state = alice.export_public_state().unwrap();
     let joiner_id = IdentityKeys::create(10).unwrap();
-    let (joiner, ext_commit) =
-        GroupSession::from_external_join(&public_state, &joiner_id, b"joiner".to_vec()).unwrap();
+    let (joiner, ext_commit) = authorize_and_join_external(&alice, &joiner_id, b"joiner");
     alice.process_commit(&ext_commit).unwrap();
 
     assert_eq!(alice.member_count().unwrap(), 2);
@@ -8177,9 +8248,7 @@ fn group_external_join_with_remove_rejected() {
     init();
 
     let alice_id = IdentityKeys::create(10).unwrap();
-    let alice_session =
-        ecliptix_protocol::protocol::group::GroupSession::create(&alice_id, b"alice".to_vec())
-            .unwrap();
+    let alice_session = create_external_joinable_group(&alice_id, b"alice");
 
     let bob_id = IdentityKeys::create(20).unwrap();
     let (bob_kp, bob_x25519_priv, bob_kyber_sec) =
@@ -8199,15 +8268,9 @@ fn group_external_join_with_remove_rejected() {
     )
     .unwrap();
 
-    let public_state = alice_session.export_public_state().unwrap();
     let joiner_id = IdentityKeys::create(30).unwrap();
     let (_joiner_session, ext_commit_bytes) =
-        ecliptix_protocol::protocol::group::GroupSession::from_external_join(
-            &public_state,
-            &joiner_id,
-            b"joiner".to_vec(),
-        )
-        .unwrap();
+        authorize_and_join_external(&alice_session, &joiner_id, b"joiner");
 
     let mut commit =
         ecliptix_protocol::proto::GroupCommit::decode(ext_commit_bytes.as_slice()).unwrap();
@@ -8252,19 +8315,10 @@ fn group_external_join_with_extra_add_rejected() {
     init();
 
     let alice_id = IdentityKeys::create(10).unwrap();
-    let alice_session =
-        ecliptix_protocol::protocol::group::GroupSession::create(&alice_id, b"alice".to_vec())
-            .unwrap();
-
-    let public_state = alice_session.export_public_state().unwrap();
+    let alice_session = create_external_joinable_group(&alice_id, b"alice");
     let joiner_id = IdentityKeys::create(20).unwrap();
     let (_joiner_session, ext_commit_bytes) =
-        ecliptix_protocol::protocol::group::GroupSession::from_external_join(
-            &public_state,
-            &joiner_id,
-            b"joiner".to_vec(),
-        )
-        .unwrap();
+        authorize_and_join_external(&alice_session, &joiner_id, b"joiner");
 
     let mut commit =
         ecliptix_protocol::proto::GroupCommit::decode(ext_commit_bytes.as_slice()).unwrap();
@@ -8313,19 +8367,10 @@ fn group_external_join_committer_leaf_mismatch_rejected() {
     init();
 
     let alice_id = IdentityKeys::create(10).unwrap();
-    let alice_session =
-        ecliptix_protocol::protocol::group::GroupSession::create(&alice_id, b"alice".to_vec())
-            .unwrap();
-
-    let public_state = alice_session.export_public_state().unwrap();
+    let alice_session = create_external_joinable_group(&alice_id, b"alice");
     let joiner_id = IdentityKeys::create(20).unwrap();
     let (_joiner_session, ext_commit_bytes) =
-        ecliptix_protocol::protocol::group::GroupSession::from_external_join(
-            &public_state,
-            &joiner_id,
-            b"joiner".to_vec(),
-        )
-        .unwrap();
+        authorize_and_join_external(&alice_session, &joiner_id, b"joiner");
 
     let mut commit =
         ecliptix_protocol::proto::GroupCommit::decode(ext_commit_bytes.as_slice()).unwrap();
@@ -8444,7 +8489,7 @@ fn secure_memory_try_clone_roundtrip() {
 fn gateway_flow_seed_server_random_client_handshake() {
     init();
     use ecliptix_protocol::api::EcliptixProtocol;
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
 
     // Server: create from seed (like gateway does with EPP_SECRET_KEY_SEED)
     let raw_seed = b"test-seed-for-gateway-1234";
@@ -8470,7 +8515,9 @@ fn gateway_flow_seed_server_random_client_handshake() {
     let mut client_session = initiator.complete(&ack_bytes).unwrap();
 
     // Step 5: Encrypt/decrypt test
-    let env = client_session.encrypt(b"hello from iOS", 0, 1, None).unwrap();
+    let env = client_session
+        .encrypt(b"hello from iOS", 0, 1, None)
+        .unwrap();
     let dec = server_session.decrypt(&env).unwrap();
     assert_eq!(dec.plaintext, b"hello from iOS");
 }
@@ -8496,7 +8543,9 @@ fn gateway_flow_cached_bundle_handshake() {
     let mut server_session = responder.complete().unwrap();
     let mut client_session = initiator.complete(&ack_bytes).unwrap();
 
-    let env = client_session.encrypt(b"cached bundle works", 0, 1, None).unwrap();
+    let env = client_session
+        .encrypt(b"cached bundle works", 0, 1, None)
+        .unwrap();
     let dec = server_session.decrypt(&env).unwrap();
     assert_eq!(dec.plaintext, b"cached bundle works");
 }
@@ -8514,14 +8563,21 @@ fn gateway_flow_bundle_bytes_stability() {
     let bundle2 = server.pre_key_bundle().unwrap();
 
     // Check if bundles are identical
-    if bundle1 != bundle2 {
-        println!("CRITICAL: pre_key_bundle() returns DIFFERENT bytes on each call!");
-        println!("  bundle1 len={}, bundle2 len={}", bundle1.len(), bundle2.len());
-    } else {
+    if bundle1 == bundle2 {
         println!("pre_key_bundle() returns identical bytes (deterministic)");
+    } else {
+        println!("CRITICAL: pre_key_bundle() returns DIFFERENT bytes on each call!");
+        println!(
+            "  bundle1 len={}, bundle2 len={}",
+            bundle1.len(),
+            bundle2.len()
+        );
     }
     // This assertion checks the hypothesis:
-    assert_eq!(bundle1, bundle2, "pre_key_bundle() must be deterministic for cached-bundle handshake to work");
+    assert_eq!(
+        bundle1, bundle2,
+        "pre_key_bundle() must be deterministic for cached-bundle handshake to work"
+    );
 }
 
 /// Simulate the exact FFI gateway flow using C FFI functions directly.
@@ -8553,7 +8609,9 @@ fn gateway_flow_ffi_responder_with_cached_bundle() {
     let mut server_session = responder.complete().unwrap();
     let mut client_session = initiator.complete(&ack_bytes).unwrap();
 
-    let env = client_session.encrypt(b"ffi cached bundle", 0, 1, None).unwrap();
+    let env = client_session
+        .encrypt(b"ffi cached bundle", 0, 1, None)
+        .unwrap();
     let dec = server_session.decrypt(&env).unwrap();
     assert_eq!(dec.plaintext, b"ffi cached bundle");
 }
@@ -8570,7 +8628,7 @@ fn gateway_flow_ffi_responder_with_cached_bundle() {
 fn gateway_flow_full_ios_simulation() {
     init();
     use ecliptix_protocol::api::EcliptixProtocol;
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
 
     // Step 1: Server creates identity from seed (exactly like gateway)
     let raw_seed = b"ecliptix-dev-seed-2026-02-27";
@@ -8584,7 +8642,15 @@ fn gateway_flow_full_ios_simulation() {
     let bundle_hash = {
         let mut h = Sha256::new();
         h.update(&cached_bundle_bytes);
-        h.finalize()[..8].iter().map(|b| format!("{b:02x}")).collect::<String>()
+        {
+            use std::fmt::Write as _;
+            let digest = h.finalize();
+            let mut out = String::new();
+            for byte in &digest[..8] {
+                let _ = write!(&mut out, "{byte:02x}");
+            }
+            out
+        }
     };
 
     // Step 3: Simulate proto roundtrip through ServerPublicKeysResponse
@@ -8605,7 +8671,8 @@ fn gateway_flow_full_ios_simulation() {
 
     // Step 6: init_bytes pass through EventEnvelope as a bytes field - no transformation
     // But let's simulate decode→encode of HandshakeInit to check
-    let decoded_init = ecliptix_protocol::proto::HandshakeInit::decode(init_bytes.as_slice()).unwrap();
+    let decoded_init =
+        ecliptix_protocol::proto::HandshakeInit::decode(init_bytes.as_slice()).unwrap();
     let roundtripped_init = decoded_init.encode_to_vec();
     assert_eq!(
         init_bytes, roundtripped_init,
@@ -8614,15 +8681,24 @@ fn gateway_flow_full_ios_simulation() {
 
     // Step 7: Server accepts session (like gateway process_handshake_init_raw → accept_session)
     let result = server.accept_session(&init_bytes);
-    assert!(result.is_ok(), "accept_session must succeed, got: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "accept_session must succeed, got: {:?}",
+        result.err()
+    );
 
     let (responder, ack_bytes) = result.unwrap();
     let mut server_session = responder.complete().unwrap();
     let mut client_session = initiator.complete(&ack_bytes).unwrap();
 
     // Verify end-to-end encryption works
-    let env = client_session.encrypt(b"hello from iOS", 0, 1, None).unwrap();
+    let env = client_session
+        .encrypt(b"hello from iOS", 0, 1, None)
+        .unwrap();
     let dec = server_session.decrypt(&env).unwrap();
     assert_eq!(dec.plaintext, b"hello from iOS");
-    eprintln!("Full iOS simulation: bundle_hash={bundle_hash}, bundle_len={}", cached_bundle_bytes.len());
+    eprintln!(
+        "Full iOS simulation: bundle_hash={bundle_hash}, bundle_len={}",
+        cached_bundle_bytes.len()
+    );
 }

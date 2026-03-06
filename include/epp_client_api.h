@@ -68,7 +68,7 @@ typedef struct EppSessionConfig {
  *   max_skipped_keys_per_sender
  *     Maximum number of out-of-order message keys cached per sender.
  *     Prevents memory exhaustion from artificially skipped messages.
- *     0 = library default (50).
+ *     0 = library default (32).
  *
  *   block_external_join
  *     Non-zero: reject ExternalInit commits from outside the group.
@@ -134,6 +134,14 @@ typedef struct EppGroupSecurityPolicy {
  *   has_franking_data
  *     Non-zero when the message carries a franking tag and franking key
  *     suitable for abuse reporting via epp_group_verify_franking().
+ *
+ *   sealed_*
+ *     Present only when has_sealed_payload != 0.  These buffers provide the
+ *     exact inputs required by epp_group_reveal_sealed().
+ *
+ *   franking_*
+ *     Present only when has_franking_data != 0.  These buffers provide the
+ *     exact inputs required by epp_group_verify_franking().
  */
 typedef struct {
     EppBuffer plaintext;
@@ -146,6 +154,14 @@ typedef struct {
     EppBuffer referenced_message_id;
     uint8_t   has_sealed_payload;
     uint8_t   has_franking_data;
+    EppBuffer sealed_hint;
+    EppBuffer sealed_encrypted_content;
+    EppBuffer sealed_nonce;
+    EppBuffer sealed_key;
+    EppBuffer franking_tag;
+    EppBuffer franking_key;
+    EppBuffer franking_content;
+    EppBuffer franking_sealed_content;
 } EppGroupDecryptResult;
 
 
@@ -724,6 +740,19 @@ EPP_API EppErrorCode epp_session_get_id(
     EppError*           out_error);
 
 /*
+ * epp_session_get_identity_binding_hash — retrieve the 32-byte authenticated
+ * identity-binding hash for the current session.
+ *
+ * This hash is computed by the native protocol from the established local and
+ * peer identity keys.  Applications can use it for TOFU, pinning, or audit
+ * logging without reimplementing the transcript rules.
+ */
+EPP_API EppErrorCode epp_session_get_identity_binding_hash(
+    EppSessionHandle*   handle,
+    EppBuffer*          out_binding_hash,
+    EppError*           out_error);
+
+/*
  * epp_session_get_peer_identity — retrieve the remote peer's public keys.
  *
  * Returns the Ed25519 and X25519 public keys that the peer presented during
@@ -962,7 +991,7 @@ EPP_API void epp_group_key_package_secrets_destroy(
  * epp_group_create — create a new group as the sole initial member.
  *
  * The caller becomes leaf index 0.  Use epp_group_add_member() to invite
- * others.  Group uses default security policy.
+ * others.  Group uses the hardened shielded policy by default.
  *
  * Parameters:
  *   identity_handle — caller's long-term identity (not consumed).
@@ -1282,6 +1311,15 @@ EPP_API EppErrorCode epp_group_decrypt_ex(
  *
  * Does NOT free the result struct itself (which is caller-allocated).
  * Zeros all EppBuffer fields after release.  Safe to call on a zeroed struct.
+ *
+ * Safety:
+ *   - Call only after a successful epp_group_decrypt_ex() (EPP_SUCCESS), or on
+ *     a zero-initialised struct (EppGroupDecryptResult result = {0}).
+ *   - If epp_group_decrypt_ex() returned an error the struct may be partially
+ *     written.  Always zero-initialise before passing to epp_group_decrypt_ex()
+ *     so that calling epp_group_decrypt_result_free() after an error is safe.
+ *   - Do NOT call epp_buffer_release() on individual fields — use this
+ *     function to release the entire result atomically.
  */
 EPP_API void epp_group_decrypt_result_free(EppGroupDecryptResult* result);
 
@@ -1462,10 +1500,6 @@ EPP_API EppErrorCode epp_group_deserialize(
  * distribute out-of-band so that prospective members can call
  * epp_group_join_external().
  *
- * The export includes the private keys of nodes on the caller's direct path
- * so that new members can process future UpdatePaths.  Treat the output as
- * sensitive; only share with authorised joining members.
- *
  * Parameters:
  *   handle           — active group session handle.
  *   out_public_state — receives the serialised PublicGroupState protobuf
@@ -1480,13 +1514,32 @@ EPP_API EppErrorCode epp_group_export_public_state(
     EppError*               out_error);
 
 /*
+ * epp_group_authorize_external_join — mint an authorization artifact for one
+ * specific external joiner.
+ *
+ * Existing members call this after verifying the joiner's identity out of
+ * band.  The returned bytes are bound to group_id + current epoch + joiner
+ * identity + joiner credential, and must be supplied to
+ * epp_group_join_external().
+ */
+EPP_API EppErrorCode epp_group_authorize_external_join(
+    EppGroupSessionHandle*  handle,
+    const uint8_t*          joiner_identity_ed25519_public,
+    size_t                  joiner_identity_ed25519_public_length,
+    const uint8_t*          joiner_identity_x25519_public,
+    size_t                  joiner_identity_x25519_public_length,
+    const uint8_t*          joiner_credential,
+    size_t                  joiner_credential_length,
+    EppBuffer*              out_authorization,
+    EppError*               out_error);
+
+/*
  * epp_group_join_external — join a group without a Welcome by performing an
  * ExternalInit.
  *
- * Uses the group's published external init key (inside public_state) to KEM
- * a new init secret, produces an ExternalInit Commit, and establishes the
- * caller as a new leaf.  Blocked if block_external_join is set in the group
- * policy (returns EPP_ERROR_GROUP_PROTOCOL).
+ * Uses the group's published external init key (inside public_state) plus a
+ * member-issued authorization artifact to KEM a new init secret, produce an
+ * ExternalInit Commit, and establish the caller as a new leaf.
  *
  * After a successful call the caller broadcasts out_commit to all existing
  * members, who apply it with epp_group_process_commit().
@@ -1496,6 +1549,9 @@ EPP_API EppErrorCode epp_group_export_public_state(
  *   public_state       — PublicGroupState bytes (from epp_group_export_public_state
  *                        of an existing member, or fetched from relay). Borrowed.
  *   public_state_length — byte length of public_state.
+ *   authorization      — authorization bytes from
+ *                        epp_group_authorize_external_join(). Borrowed.
+ *   authorization_length — byte length of authorization.
  *   credential         — caller's application credential to embed in the tree
  *                        (borrowed).
  *   credential_length  — byte length of credential.
@@ -1512,6 +1568,8 @@ EPP_API EppErrorCode epp_group_join_external(
     EppIdentityHandle*      identity_handle,
     const uint8_t*          public_state,
     size_t                  public_state_length,
+    const uint8_t*          authorization,
+    size_t                  authorization_length,
     const uint8_t*          credential,
     size_t                  credential_length,
     EppGroupSessionHandle** out_group_handle,

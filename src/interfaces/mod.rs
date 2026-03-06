@@ -4,10 +4,6 @@
 use crate::core::errors::ProtocolError;
 use crate::crypto::{CryptoInterop, SecureMemoryHandle};
 
-pub trait IKeyProvider: Send + Sync {
-    fn get_key_bytes(&self) -> Result<Vec<u8>, ProtocolError>;
-}
-
 pub trait IStateKeyProvider: Send + Sync {
     fn get_state_encryption_key(&self) -> Result<SecureMemoryHandle, ProtocolError>;
 }

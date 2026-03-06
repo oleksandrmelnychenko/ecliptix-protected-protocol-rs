@@ -21,11 +21,10 @@ use std::mem::size_of;
 use std::os::raw::c_char;
 
 use crate::core::constants::{
-    AES_GCM_NONCE_BYTES, AES_KEY_BYTES, DEFAULT_ONE_TIME_KEY_COUNT,
-    ED25519_PUBLIC_KEY_BYTES, HMAC_BYTES, KYBER_PUBLIC_KEY_BYTES, MAX_BUFFER_SIZE,
-    MAX_ENVELOPE_MESSAGE_SIZE, MAX_GROUP_MESSAGE_SIZE, MAX_HANDSHAKE_MESSAGE_SIZE,
-    MESSAGE_ID_BYTES, PROTOCOL_VERSION, PSK_BYTES, ROOT_KEY_BYTES,
-    X25519_PUBLIC_KEY_BYTES,
+    AES_GCM_NONCE_BYTES, AES_KEY_BYTES, DEFAULT_ONE_TIME_KEY_COUNT, ED25519_PUBLIC_KEY_BYTES,
+    HMAC_BYTES, KYBER_PUBLIC_KEY_BYTES, MAX_BUFFER_SIZE, MAX_ENVELOPE_MESSAGE_SIZE,
+    MAX_GROUP_MESSAGE_SIZE, MAX_HANDSHAKE_MESSAGE_SIZE, MESSAGE_ID_BYTES, PROTOCOL_VERSION,
+    PSK_BYTES, X25519_PUBLIC_KEY_BYTES,
 };
 use crate::core::errors::ProtocolError;
 use crate::crypto::SecureMemoryHandle;
@@ -170,15 +169,10 @@ const fn error_code_from_protocol(e: &ProtocolError) -> EppErrorCode {
 }
 
 /// # Safety
-/// `out_error` must be null or point to a valid, writable `EppError`.  If `(*out_error).message`
-/// is non-null it must have been allocated by `CString::into_raw`.
+/// `out_error` must be null or point to a valid, writable `EppError`.
 unsafe fn write_error(out_error: *mut EppError, code: EppErrorCode, msg: &str) {
     if out_error.is_null() {
         return;
-    }
-    if !(*out_error).message.is_null() {
-        drop(CString::from_raw((*out_error).message));
-        (*out_error).message = std::ptr::null_mut();
     }
     let c_msg = CString::new(msg).unwrap_or_else(|_| c"error".to_owned());
     (*out_error).code = code;
@@ -319,7 +313,7 @@ const unsafe fn group_ref_or_none<'a>(
 
 #[no_mangle]
 pub extern "C" fn epp_version() -> *const c_char {
-    static VERSION: &[u8] = b"1.0.0\0";
+    static VERSION: &[u8] = b"1.0.1\0";
     VERSION.as_ptr().cast::<c_char>()
 }
 
@@ -1054,7 +1048,7 @@ pub unsafe extern "C" fn epp_session_decrypt(
     out_error: *mut EppError,
 ) -> EppErrorCode {
     ffi_catch_panic!(out_error, unsafe {
-        if encrypted_envelope.is_null() || out_plaintext.is_null() || out_metadata.is_null() {
+        if encrypted_envelope.is_null() || out_plaintext.is_null() {
             write_error(
                 out_error,
                 EppErrorCode::EppErrorNullPointer,
@@ -1092,18 +1086,20 @@ pub unsafe extern "C" fn epp_session_decrypt(
             Err(e) => return write_protocol_error(out_error, &e),
         };
 
-        let mut meta_buf = Vec::new();
-        if let Err(e) = result.metadata.encode(&mut meta_buf) {
-            write_error(
-                out_error,
-                EppErrorCode::EppErrorEncode,
-                &format!("Failed to encode EnvelopeMetadata: {e}"),
-            );
-            return EppErrorCode::EppErrorEncode;
+        if !out_metadata.is_null() {
+            let mut meta_buf = Vec::new();
+            if let Err(e) = result.metadata.encode(&mut meta_buf) {
+                write_error(
+                    out_error,
+                    EppErrorCode::EppErrorEncode,
+                    &format!("Failed to encode EnvelopeMetadata: {e}"),
+                );
+                return EppErrorCode::EppErrorEncode;
+            }
+            write_buffer(out_metadata, meta_buf);
         }
 
         write_buffer(out_plaintext, result.plaintext);
-        write_buffer(out_metadata, meta_buf);
         EppErrorCode::EppSuccess
     })
 }
@@ -1204,21 +1200,21 @@ pub unsafe extern "C" fn epp_derive_root_key(
             );
             return EppErrorCode::EppErrorNullPointer;
         }
-        if out_root_key_length < ROOT_KEY_BYTES {
+        if out_root_key_length == 0 || out_root_key_length > 64 {
             write_error(
                 out_error,
-                EppErrorCode::EppErrorBufferTooSmall,
-                "Output buffer too small for derived root key",
+                EppErrorCode::EppErrorInvalidInput,
+                "Output buffer length must be in the range 1..=64",
             );
-            return EppErrorCode::EppErrorBufferTooSmall;
+            return EppErrorCode::EppErrorInvalidInput;
         }
 
         let ikm = std::slice::from_raw_parts(opaque_session_key, opaque_session_key_length);
         let ctx = std::slice::from_raw_parts(user_context, user_context_length);
 
-        match crate::api::EcliptixProtocol::derive_root_key(ikm, ctx) {
+        match crate::api::EcliptixProtocol::derive_root_key(ikm, ctx, out_root_key_length) {
             Ok(key) => {
-                std::ptr::copy_nonoverlapping(key.as_ptr(), out_root_key, ROOT_KEY_BYTES);
+                std::ptr::copy_nonoverlapping(key.as_ptr(), out_root_key, out_root_key_length);
                 EppErrorCode::EppSuccess
             }
             Err(e) => write_protocol_error(out_error, &e),
@@ -1281,7 +1277,7 @@ pub unsafe extern "C" fn epp_shamir_split(
             Err(e) => return write_protocol_error(out_error, &e),
         };
 
-        let data_share_count = shares.len() - 1;
+        let data_share_count = shares.len().saturating_sub(1);
         if data_share_count == 0 {
             write_error(
                 out_error,
@@ -1297,9 +1293,8 @@ pub unsafe extern "C" fn epp_shamir_split(
             write_error(out_error, EppErrorCode::EppErrorGeneric, "Empty shares");
             return EppErrorCode::EppErrorGeneric;
         };
-        let Some(total_len) = data_share_count
-            .checked_mul(data_share_len)
-            .and_then(|v| v.checked_add(auth_tag.len()))
+        let Some(total_len) =
+            data_share_count.checked_mul(data_share_len.saturating_add(auth_tag.len()))
         else {
             write_error(
                 out_error,
@@ -1311,9 +1306,9 @@ pub unsafe extern "C" fn epp_shamir_split(
         let mut flat = Vec::with_capacity(total_len);
         for ds in &shares[..data_share_count] {
             flat.extend_from_slice(ds);
+            flat.extend_from_slice(auth_tag);
         }
-        flat.extend_from_slice(auth_tag);
-        *out_share_length = data_share_len;
+        *out_share_length = data_share_len + auth_tag.len();
         write_buffer(out_shares, flat);
 
         EppErrorCode::EppSuccess
@@ -1361,30 +1356,65 @@ pub unsafe extern "C" fn epp_shamir_reconstruct(
             return EppErrorCode::EppErrorInvalidInput;
         }
 
-        let expected_len = share_count
-            .saturating_mul(share_length)
-            .saturating_add(HMAC_BYTES);
+        let expected_len = share_count.saturating_mul(share_length);
         if shares_length != expected_len {
             write_error(
                 out_error,
                 EppErrorCode::EppErrorInvalidInput,
-                "shares_length must equal share_count * share_length + 32",
+                "shares_length must equal share_count * share_length",
+            );
+            return EppErrorCode::EppErrorInvalidInput;
+        }
+        if share_length <= HMAC_BYTES {
+            write_error(
+                out_error,
+                EppErrorCode::EppErrorInvalidInput,
+                "share_length must be larger than the embedded auth tag",
             );
             return EppErrorCode::EppErrorInvalidInput;
         }
 
         let flat_slice = std::slice::from_raw_parts(shares, shares_length);
         let auth_key_slice = std::slice::from_raw_parts(auth_key, auth_key_length);
+        let data_share_len = share_length - HMAC_BYTES;
 
-        let data_bytes = &flat_slice[..share_count * share_length];
-        let auth_tag = &flat_slice[share_count * share_length..];
+        let mut auth_tag: Option<Vec<u8>> = None;
+        let mut all_shares: Vec<Vec<u8>> = Vec::with_capacity(share_count + 1);
+        for i in 0..share_count {
+            let start = i * share_length;
+            let data_end = start + data_share_len;
+            let end = start + share_length;
+            let share = flat_slice[start..data_end].to_vec();
+            let share_tag = flat_slice[data_end..end].to_vec();
+            if let Some(existing) = &auth_tag {
+                if existing != &share_tag {
+                    write_error(
+                        out_error,
+                        EppErrorCode::EppErrorInvalidInput,
+                        "All Shamir shares must carry the same auth tag",
+                    );
+                    return EppErrorCode::EppErrorInvalidInput;
+                }
+            } else {
+                auth_tag = Some(share_tag);
+            }
+            all_shares.push(share);
+        }
+        let Some(tag) = auth_tag else {
+            write_error(
+                out_error,
+                EppErrorCode::EppErrorInvalidInput,
+                "No auth tag found in shares",
+            );
+            return EppErrorCode::EppErrorInvalidInput;
+        };
+        all_shares.push(tag);
 
-        let mut all_shares: Vec<Vec<u8>> = (0..share_count)
-            .map(|i| data_bytes[i * share_length..(i + 1) * share_length].to_vec())
-            .collect();
-        all_shares.push(auth_tag.to_vec());
-
-        match crate::api::EcliptixProtocol::shamir_reconstruct(&all_shares, auth_key_slice, share_count) {
+        match crate::api::EcliptixProtocol::shamir_reconstruct(
+            &all_shares,
+            auth_key_slice,
+            share_count,
+        ) {
             Ok(secret) => {
                 write_buffer(out_secret, secret);
                 EppErrorCode::EppSuccess
@@ -2350,7 +2380,63 @@ pub unsafe extern "C" fn epp_group_export_public_state(
 }
 
 /// # Safety
-/// See module-level FFI safety contract.  `(public_state, public_state_length)` and
+/// See module-level FFI safety contract.  `(joiner_identity_ed25519_public, joiner_identity_ed25519_public_length)`,
+/// `(joiner_identity_x25519_public, joiner_identity_x25519_public_length)`, and
+/// `(joiner_credential, joiner_credential_length)` must form valid readable slices.
+#[no_mangle]
+pub unsafe extern "C" fn epp_group_authorize_external_join(
+    handle: *mut EppGroupSessionHandle,
+    joiner_identity_ed25519_public: *const u8,
+    joiner_identity_ed25519_public_length: usize,
+    joiner_identity_x25519_public: *const u8,
+    joiner_identity_x25519_public_length: usize,
+    joiner_credential: *const u8,
+    joiner_credential_length: usize,
+    out_authorization: *mut EppBuffer,
+    out_error: *mut EppError,
+) -> EppErrorCode {
+    ffi_catch_panic!(out_error, unsafe {
+        if joiner_identity_ed25519_public.is_null()
+            || joiner_identity_x25519_public.is_null()
+            || out_authorization.is_null()
+        {
+            write_error(
+                out_error,
+                EppErrorCode::EppErrorNullPointer,
+                "A required pointer is null",
+            );
+            return EppErrorCode::EppErrorNullPointer;
+        }
+        let session = match require_group_mut(handle, out_error) {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
+        let joiner_ed = std::slice::from_raw_parts(
+            joiner_identity_ed25519_public,
+            joiner_identity_ed25519_public_length,
+        );
+        let joiner_x = std::slice::from_raw_parts(
+            joiner_identity_x25519_public,
+            joiner_identity_x25519_public_length,
+        );
+        let joiner_credential = if joiner_credential.is_null() || joiner_credential_length == 0 {
+            &[][..]
+        } else {
+            std::slice::from_raw_parts(joiner_credential, joiner_credential_length)
+        };
+        match session.authorize_external_join(joiner_ed, joiner_x, joiner_credential) {
+            Ok(bytes) => {
+                write_buffer(out_authorization, bytes);
+                EppErrorCode::EppSuccess
+            }
+            Err(e) => write_protocol_error(out_error, &e),
+        }
+    })
+}
+
+/// # Safety
+/// See module-level FFI safety contract.  `(public_state, public_state_length)`,
+/// `(authorization, authorization_length)`, and
 /// `(credential, credential_length)` must form valid readable slices.
 /// `out_group_handle` must point to writable `*mut EppGroupSessionHandle`.
 #[no_mangle]
@@ -2358,6 +2444,8 @@ pub unsafe extern "C" fn epp_group_join_external(
     identity_handle: *mut EppIdentityHandle,
     public_state: *const u8,
     public_state_length: usize,
+    authorization: *const u8,
+    authorization_length: usize,
     credential: *const u8,
     credential_length: usize,
     out_group_handle: *mut *mut EppGroupSessionHandle,
@@ -2365,7 +2453,11 @@ pub unsafe extern "C" fn epp_group_join_external(
     out_error: *mut EppError,
 ) -> EppErrorCode {
     ffi_catch_panic!(out_error, unsafe {
-        if public_state.is_null() || out_group_handle.is_null() || out_commit.is_null() {
+        if public_state.is_null()
+            || authorization.is_null()
+            || out_group_handle.is_null()
+            || out_commit.is_null()
+        {
             write_error(
                 out_error,
                 EppErrorCode::EppErrorNullPointer,
@@ -2391,6 +2483,7 @@ pub unsafe extern "C" fn epp_group_join_external(
         }
 
         let state_slice = std::slice::from_raw_parts(public_state, public_state_length);
+        let auth_slice = std::slice::from_raw_parts(authorization, authorization_length);
         let cred = if credential.is_null() || credential_length == 0 {
             vec![]
         } else {
@@ -2401,7 +2494,7 @@ pub unsafe extern "C" fn epp_group_join_external(
             Ok(v) => v,
             Err(code) => return code,
         };
-        match GroupSession::from_external_join(state_slice, identity, cred) {
+        match GroupSession::from_external_join(state_slice, auth_slice, identity, cred) {
             Ok((session, commit_bytes)) => {
                 *out_group_handle = Box::into_raw(Box::new(EppGroupSessionHandle(Some(session))));
                 write_buffer(out_commit, commit_bytes);
@@ -2660,11 +2753,6 @@ pub unsafe extern "C" fn epp_session_deserialize_sealed(
 
         let state_slice = std::slice::from_raw_parts(state_bytes, state_length);
         let key_slice = std::slice::from_raw_parts(key, key_length);
-        let external_counter = match Session::sealed_state_external_counter(state_slice) {
-            Ok(c) => c,
-            Err(e) => return write_protocol_error(out_error, &e),
-        };
-        *out_external_counter = external_counter;
         let mut smh = match SecureMemoryHandle::allocate(AES_KEY_BYTES) {
             Ok(h) => h,
             Err(e) => {
@@ -2684,6 +2772,12 @@ pub unsafe extern "C" fn epp_session_deserialize_sealed(
             );
             return EppErrorCode::EppErrorGeneric;
         }
+
+        let external_counter = match Session::sealed_state_external_counter(state_slice) {
+            Ok(c) => c,
+            Err(e) => return write_protocol_error(out_error, &e),
+        };
+        *out_external_counter = external_counter;
 
         let provider = FfiStateKeyProvider { handle: smh };
         match Session::from_sealed_state(state_slice, &provider, min_external_counter) {
@@ -2958,6 +3052,14 @@ pub struct EppGroupDecryptResult {
     pub referenced_message_id: EppBuffer,
     pub has_sealed_payload: u8,
     pub has_franking_data: u8,
+    pub sealed_hint: EppBuffer,
+    pub sealed_encrypted_content: EppBuffer,
+    pub sealed_nonce: EppBuffer,
+    pub sealed_key: EppBuffer,
+    pub franking_tag: EppBuffer,
+    pub franking_key: EppBuffer,
+    pub franking_content: EppBuffer,
+    pub franking_sealed_content: EppBuffer,
 }
 
 /// # Safety
@@ -2970,6 +3072,14 @@ pub unsafe extern "C" fn epp_group_decrypt_result_free(result: *mut EppGroupDecr
     epp_buffer_release(std::ptr::addr_of_mut!((*result).plaintext));
     epp_buffer_release(std::ptr::addr_of_mut!((*result).message_id));
     epp_buffer_release(std::ptr::addr_of_mut!((*result).referenced_message_id));
+    epp_buffer_release(std::ptr::addr_of_mut!((*result).sealed_hint));
+    epp_buffer_release(std::ptr::addr_of_mut!((*result).sealed_encrypted_content));
+    epp_buffer_release(std::ptr::addr_of_mut!((*result).sealed_nonce));
+    epp_buffer_release(std::ptr::addr_of_mut!((*result).sealed_key));
+    epp_buffer_release(std::ptr::addr_of_mut!((*result).franking_tag));
+    epp_buffer_release(std::ptr::addr_of_mut!((*result).franking_key));
+    epp_buffer_release(std::ptr::addr_of_mut!((*result).franking_content));
+    epp_buffer_release(std::ptr::addr_of_mut!((*result).franking_sealed_content));
 }
 
 /// # Safety
@@ -3014,13 +3124,85 @@ pub unsafe extern "C" fn epp_group_decrypt_ex(
                 (*out_result).content_type = r.content_type.to_u32();
                 (*out_result).ttl_seconds = r.ttl_seconds;
                 (*out_result).sent_timestamp = r.sent_timestamp;
-                write_buffer(std::ptr::addr_of_mut!((*out_result).message_id), r.message_id);
+                write_buffer(
+                    std::ptr::addr_of_mut!((*out_result).message_id),
+                    r.message_id,
+                );
                 write_buffer(
                     std::ptr::addr_of_mut!((*out_result).referenced_message_id),
                     r.referenced_message_id,
                 );
-                (*out_result).has_sealed_payload = u8::from(r.sealed_payload.is_some());
-                (*out_result).has_franking_data = u8::from(r.franking_data.is_some());
+                if let Some(sealed) = r.sealed_payload {
+                    (*out_result).has_sealed_payload = 1;
+                    write_buffer(
+                        std::ptr::addr_of_mut!((*out_result).sealed_hint),
+                        sealed.hint.clone(),
+                    );
+                    write_buffer(
+                        std::ptr::addr_of_mut!((*out_result).sealed_encrypted_content),
+                        sealed.encrypted_content.clone(),
+                    );
+                    write_buffer(
+                        std::ptr::addr_of_mut!((*out_result).sealed_nonce),
+                        sealed.nonce.clone(),
+                    );
+                    write_buffer(
+                        std::ptr::addr_of_mut!((*out_result).sealed_key),
+                        sealed.seal_key.clone(),
+                    );
+                } else {
+                    (*out_result).has_sealed_payload = 0;
+                    write_buffer(
+                        std::ptr::addr_of_mut!((*out_result).sealed_hint),
+                        Vec::new(),
+                    );
+                    write_buffer(
+                        std::ptr::addr_of_mut!((*out_result).sealed_encrypted_content),
+                        Vec::new(),
+                    );
+                    write_buffer(
+                        std::ptr::addr_of_mut!((*out_result).sealed_nonce),
+                        Vec::new(),
+                    );
+                    write_buffer(std::ptr::addr_of_mut!((*out_result).sealed_key), Vec::new());
+                }
+                if let Some(franking) = r.franking_data {
+                    (*out_result).has_franking_data = 1;
+                    write_buffer(
+                        std::ptr::addr_of_mut!((*out_result).franking_tag),
+                        franking.franking_tag.clone(),
+                    );
+                    write_buffer(
+                        std::ptr::addr_of_mut!((*out_result).franking_key),
+                        franking.franking_key.clone(),
+                    );
+                    write_buffer(
+                        std::ptr::addr_of_mut!((*out_result).franking_content),
+                        franking.content.clone(),
+                    );
+                    write_buffer(
+                        std::ptr::addr_of_mut!((*out_result).franking_sealed_content),
+                        franking.sealed_content.clone(),
+                    );
+                } else {
+                    (*out_result).has_franking_data = 0;
+                    write_buffer(
+                        std::ptr::addr_of_mut!((*out_result).franking_tag),
+                        Vec::new(),
+                    );
+                    write_buffer(
+                        std::ptr::addr_of_mut!((*out_result).franking_key),
+                        Vec::new(),
+                    );
+                    write_buffer(
+                        std::ptr::addr_of_mut!((*out_result).franking_content),
+                        Vec::new(),
+                    );
+                    write_buffer(
+                        std::ptr::addr_of_mut!((*out_result).franking_sealed_content),
+                        Vec::new(),
+                    );
+                }
                 EppErrorCode::EppSuccess
             }
             Err(e) => write_protocol_error(out_error, &e),
@@ -3052,12 +3234,8 @@ pub unsafe extern "C" fn epp_group_compute_message_id(
         }
 
         let gid = std::slice::from_raw_parts(group_id, group_id_length);
-        let id = crate::protocol::group::compute_message_id(
-            gid,
-            epoch,
-            sender_leaf_index,
-            generation,
-        );
+        let id =
+            crate::protocol::group::compute_message_id(gid, epoch, sender_leaf_index, generation);
         write_buffer(out_message_id, id);
         EppErrorCode::EppSuccess
     })
@@ -3068,7 +3246,7 @@ pub unsafe extern "C" fn epp_group_compute_message_id(
 /// `(nonce, nonce_length)`, and `(seal_key, seal_key_length)` must form valid readable slices.
 #[no_mangle]
 pub unsafe extern "C" fn epp_group_reveal_sealed(
-    hint: *const u8,
+    _hint: *const u8,
     hint_length: usize,
     encrypted_content: *const u8,
     encrypted_content_length: usize,
@@ -3126,11 +3304,6 @@ pub unsafe extern "C" fn epp_group_reveal_sealed(
             return EppErrorCode::EppErrorInvalidInput;
         }
 
-        let _ = if hint.is_null() || hint_length == 0 {
-            &[] as &[u8]
-        } else {
-            std::slice::from_raw_parts(hint, hint_length)
-        };
         let ec = std::slice::from_raw_parts(encrypted_content, encrypted_content_length);
         let n = std::slice::from_raw_parts(nonce, nonce_length);
         let sk = std::slice::from_raw_parts(seal_key, seal_key_length);
@@ -3314,6 +3487,32 @@ pub unsafe extern "C" fn epp_session_get_id(
 /// # Safety
 /// See module-level FFI safety contract.
 #[no_mangle]
+pub unsafe extern "C" fn epp_session_get_identity_binding_hash(
+    handle: *mut EppSessionHandle,
+    out_binding_hash: *mut EppBuffer,
+    out_error: *mut EppError,
+) -> EppErrorCode {
+    ffi_catch_panic!(out_error, unsafe {
+        if out_binding_hash.is_null() {
+            write_error(
+                out_error,
+                EppErrorCode::EppErrorNullPointer,
+                "out_binding_hash is null",
+            );
+            return EppErrorCode::EppErrorNullPointer;
+        }
+        let session = match require_session_mut(handle, out_error) {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
+        write_buffer(out_binding_hash, session.get_identity_binding_hash());
+        EppErrorCode::EppSuccess
+    })
+}
+
+/// # Safety
+/// See module-level FFI safety contract.
+#[no_mangle]
 pub unsafe extern "C" fn epp_session_get_peer_identity(
     handle: *mut EppSessionHandle,
     out_identity: *mut EppSessionPeerIdentity,
@@ -3399,9 +3598,10 @@ pub unsafe extern "C" fn epp_session_get_local_identity(
 
 // ─── OTK replenishment ─────────────────────────────────────────────────────
 
-/// Generates `count` fresh OTKs, adds them to the identity's local pool, and
-/// returns a partial PreKeyBundle proto (only one_time_pre_keys populated)
-/// suitable for uploading to the key server.  Release with epp_buffer_release.
+/// Generates `count` fresh OTKs and adds them to the local pool.
+///
+/// Returns a partial `PreKeyBundle` proto containing only
+/// `one_time_pre_keys`, suitable for upload via `epp_buffer_release()`.
 ///
 /// # Safety
 /// See module-level FFI safety contract.
@@ -3509,7 +3709,6 @@ pub unsafe extern "C" fn epp_envelope_metadata_parse(
             }
         };
         let envelope_type = match proto.envelope_type {
-            0 => EppEnvelopeType::EppEnvelopeRequest,
             1 => EppEnvelopeType::EppEnvelopeResponse,
             2 => EppEnvelopeType::EppEnvelopeNotification,
             3 => EppEnvelopeType::EppEnvelopeHeartbeat,
@@ -3517,13 +3716,14 @@ pub unsafe extern "C" fn epp_envelope_metadata_parse(
             _ => EppEnvelopeType::EppEnvelopeRequest,
         };
         let (correlation_id_ptr, correlation_id_length) =
-            if let Some(ref cid) = proto.correlation_id {
-                let cstr = CString::new(cid.as_str()).unwrap_or_default();
-                let len = cstr.as_bytes().len();
-                (cstr.into_raw(), len)
-            } else {
-                (std::ptr::null_mut(), 0)
-            };
+            proto
+                .correlation_id
+                .as_ref()
+                .map_or((std::ptr::null_mut(), 0), |cid| {
+                    let cstr = CString::new(cid.as_str()).unwrap_or_default();
+                    let len = cstr.as_bytes().len();
+                    (cstr.into_raw(), len)
+                });
         *out_meta = EppEnvelopeMetadata {
             envelope_type,
             envelope_id: proto.envelope_id,
@@ -3562,8 +3762,7 @@ pub type EppOnHandshakeCompleted = Option<
 >;
 
 /// Called every time the DH ratchet rotates (a new ratchet epoch begins).
-pub type EppOnRatchetRotated =
-    Option<unsafe extern "C" fn(epoch: u64, user_data: *mut c_void)>;
+pub type EppOnRatchetRotated = Option<unsafe extern "C" fn(epoch: u64, user_data: *mut c_void)>;
 
 /// Called on an internal protocol error (non-fatal; logged for diagnostics).
 /// `code` is the error category; `message` is a null-terminated description.
@@ -3573,9 +3772,8 @@ pub type EppOnSessionError = Option<
 
 /// Called when fewer than ~20 % of the nonce budget remains for the current
 /// chain.  The app should send or receive a message to trigger a ratchet step.
-pub type EppOnNonceExhaustionWarning = Option<
-    unsafe extern "C" fn(remaining: u64, max_capacity: u64, user_data: *mut c_void),
->;
+pub type EppOnNonceExhaustionWarning =
+    Option<unsafe extern "C" fn(remaining: u64, max_capacity: u64, user_data: *mut c_void)>;
 
 /// Called when many messages have been sent without a DH ratchet step
 /// (the peer may be offline).  Consider forcing a ratchet reset.
@@ -3605,13 +3803,20 @@ struct CFfiSessionEventHandler {
 
 // Safety: C function pointers and *mut c_void are safe to move across threads
 // when the caller guarantees thread-safe user_data access.
+#[allow(clippy::non_send_fields_in_send_ty)]
 unsafe impl Send for CFfiSessionEventHandler {}
 unsafe impl Sync for CFfiSessionEventHandler {}
 
 impl IProtocolEventHandler for CFfiSessionEventHandler {
     fn on_handshake_completed(&self, session_id: &[u8]) {
         if let Some(cb) = self.callbacks.on_handshake_completed {
-            unsafe { cb(session_id.as_ptr(), session_id.len(), self.callbacks.user_data) };
+            unsafe {
+                cb(
+                    session_id.as_ptr(),
+                    session_id.len(),
+                    self.callbacks.user_data,
+                );
+            };
         }
     }
 
@@ -3691,21 +3896,19 @@ pub type EppOnMemberAdded = Option<
 >;
 
 /// Called when a member is removed from the group via a Commit.
-pub type EppOnMemberRemoved =
-    Option<unsafe extern "C" fn(leaf_index: u32, user_data: *mut c_void)>;
+pub type EppOnMemberRemoved = Option<unsafe extern "C" fn(leaf_index: u32, user_data: *mut c_void)>;
 
 /// Called every time a Commit is applied and the epoch number advances.
-pub type EppOnEpochAdvanced = Option<
-    unsafe extern "C" fn(new_epoch: u64, member_count: u32, user_data: *mut c_void),
->;
+pub type EppOnEpochAdvanced =
+    Option<unsafe extern "C" fn(new_epoch: u64, member_count: u32, user_data: *mut c_void)>;
 
 /// Called when the sender-key generation counter for this member is running
 /// low (approaching max_messages_per_epoch).  Trigger an Update commit soon.
-pub type EppOnSenderKeyExhaustionWarning = Option<
-    unsafe extern "C" fn(remaining: u32, max_capacity: u32, user_data: *mut c_void),
->;
+pub type EppOnSenderKeyExhaustionWarning =
+    Option<unsafe extern "C" fn(remaining: u32, max_capacity: u32, user_data: *mut c_void)>;
 
 /// Called when a ReInit proposal is applied in a Commit.
+///
 /// The group is now deprecated; migrate to `new_group_id` at `new_version`.
 /// `new_group_id` / `new_group_id_len` are valid only for the duration of
 /// the callback.
@@ -3736,6 +3939,7 @@ struct CFfiGroupEventHandler {
     callbacks: EppGroupEventCallbacks,
 }
 
+#[allow(clippy::non_send_fields_in_send_ty)]
 unsafe impl Send for CFfiGroupEventHandler {}
 unsafe impl Sync for CFfiGroupEventHandler {}
 
@@ -3748,7 +3952,7 @@ impl IGroupEventHandler for CFfiGroupEventHandler {
                     identity_ed25519.as_ptr(),
                     identity_ed25519.len(),
                     self.callbacks.user_data,
-                )
+                );
             };
         }
     }
@@ -3779,7 +3983,7 @@ impl IGroupEventHandler for CFfiGroupEventHandler {
                     new_group_id.len(),
                     new_version,
                     self.callbacks.user_data,
-                )
+                );
             };
         }
     }
@@ -3819,12 +4023,12 @@ pub unsafe extern "C" fn epp_group_set_event_handler(
 
 // ─── C event callbacks — identity ──────────────────────────────────────────
 
-/// Called after an OTK is consumed and the remaining pool has dropped below
-/// the exhaustion-warning threshold (default: ≤ 10 % of max_capacity).
+/// Called after an OTK is consumed and the remaining pool drops below the
+/// exhaustion-warning threshold.
+///
 /// Upload fresh OTKs via `epp_prekey_bundle_replenish` before supply runs out.
-pub type EppOnOtkExhaustionWarning = Option<
-    unsafe extern "C" fn(remaining: u32, max_capacity: u32, user_data: *mut c_void),
->;
+pub type EppOnOtkExhaustionWarning =
+    Option<unsafe extern "C" fn(remaining: u32, max_capacity: u32, user_data: *mut c_void)>;
 
 /// Set of C function-pointer callbacks for an identity handle.
 /// Any slot may be NULL to ignore that event.
@@ -3841,6 +4045,7 @@ struct CFfiIdentityEventHandler {
     callbacks: EppIdentityEventCallbacks,
 }
 
+#[allow(clippy::non_send_fields_in_send_ty)]
 unsafe impl Send for CFfiIdentityEventHandler {}
 unsafe impl Sync for CFfiIdentityEventHandler {}
 

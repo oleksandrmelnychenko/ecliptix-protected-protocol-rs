@@ -25,12 +25,12 @@ use crate::core::errors::ProtocolError;
 use crate::crypto::{AesGcm, CryptoInterop, HkdfSha256, MessagePadding, SecureMemoryHandle};
 use crate::identity::IdentityKeys;
 use crate::interfaces::IGroupEventHandler;
-use crate::proto::{
-    GroupApplicationMessage, GroupCommit, GroupKeyPackage, GroupMemberSenderChain, GroupMessage,
-    GroupMessagePolicy, GroupPlaintext, GroupProposal, GroupProtocolState, GroupPublicState,
-    GroupSenderData, SealedGroupState,
-};
 use crate::proto::GroupSecurityPolicy as ProtoGroupSecurityPolicy;
+use crate::proto::{
+    GroupApplicationMessage, GroupCommit, GroupExternalJoinAuthorization, GroupKeyPackage,
+    GroupMemberSenderChain, GroupMessage, GroupMessagePolicy, GroupPlaintext, GroupProposal,
+    GroupProtocolState, GroupPublicState, GroupSenderData, SealedGroupState,
+};
 
 pub use key_schedule::{EpochKeys, GroupKeySchedule};
 pub use sender_key::{SenderKeyChain, SenderKeyStore};
@@ -171,6 +171,18 @@ impl Drop for GroupSessionInner {
         CryptoInterop::secure_wipe(&mut self.init_secret);
         CryptoInterop::secure_wipe(&mut self.group_context_hash);
     }
+}
+
+fn ensure_no_pending_reinit(
+    inner: &GroupSessionInner,
+    operation: &str,
+) -> Result<(), ProtocolError> {
+    if inner.pending_reinit.is_some() {
+        return Err(ProtocolError::group_protocol(format!(
+            "{operation} blocked: group has a pending reinit and is now read-only",
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,7 +368,7 @@ fn is_all_zero(bytes: &[u8]) -> bool {
 
 impl GroupSession {
     pub fn create(identity: &IdentityKeys, credential: Vec<u8>) -> Result<Self, ProtocolError> {
-        Self::create_with_policy(identity, credential, GroupSecurityPolicy::default())
+        Self::create_with_policy(identity, credential, GroupSecurityPolicy::shield())
     }
 
     pub fn create_with_policy(
@@ -380,6 +392,7 @@ impl GroupSession {
             kp.identity_ed25519_public.clone(),
             kp.identity_x25519_public.clone(),
             credential,
+            kp.signature.clone(),
         )?;
 
         let tree_hash = tree.tree_hash()?;
@@ -387,12 +400,8 @@ impl GroupSession {
         let policy_bytes = policy.policy_bytes();
         let zero_init_secret = vec![0u8; INIT_SECRET_BYTES];
         let commit_secret = CryptoInterop::get_random_bytes(COMMIT_SECRET_BYTES);
-        let group_context_hash = GroupKeySchedule::compute_group_context_hash(
-            &group_id,
-            0,
-            &tree_hash,
-            &policy_bytes,
-        );
+        let group_context_hash =
+            GroupKeySchedule::compute_group_context_hash(&group_id, 0, &tree_hash, &policy_bytes);
 
         let epoch_keys = GroupKeySchedule::derive_epoch_keys(
             &zero_init_secret,
@@ -447,6 +456,7 @@ impl GroupSession {
             .inner
             .lock()
             .map_err(|_| ProtocolError::invalid_state("GroupSession lock poisoned"))?;
+        ensure_no_pending_reinit(&inner, "add_member")?;
         inner.psk_resolver = Some(resolver);
         Ok(())
     }
@@ -482,8 +492,7 @@ impl GroupSession {
             identity_x25519,
         )?;
 
-        let security_policy =
-            GroupSecurityPolicy::from_proto_bytes(&result.security_policy_bytes)?;
+        let security_policy = GroupSecurityPolicy::from_proto_bytes(&result.security_policy_bytes)?;
         security_policy.validate()?;
         let init_secret = result.epoch_keys.init_secret.clone();
 
@@ -555,6 +564,7 @@ impl GroupSession {
             .inner
             .lock()
             .map_err(|_| ProtocolError::invalid_state("GroupSession lock poisoned"))?;
+        ensure_no_pending_reinit(&inner, "remove_member")?;
 
         let add_proposal = GroupProposal {
             proposal: Some(crate::proto::group_proposal::Proposal::Add(
@@ -642,6 +652,7 @@ impl GroupSession {
             .inner
             .lock()
             .map_err(|_| ProtocolError::invalid_state("GroupSession lock poisoned"))?;
+        ensure_no_pending_reinit(&inner, "update")?;
 
         let remove_proposal = GroupProposal {
             proposal: Some(crate::proto::group_proposal::Proposal::Remove(
@@ -705,6 +716,7 @@ impl GroupSession {
             .inner
             .lock()
             .map_err(|_| ProtocolError::invalid_state("GroupSession lock poisoned"))?;
+        ensure_no_pending_reinit(&inner, "create_reinit_commit")?;
 
         let my_leaf_idx = inner.my_leaf_idx;
         let init_secret = Zeroizing::new(inner.init_secret.clone());
@@ -741,7 +753,6 @@ impl GroupSession {
         inner.group_context_hash = commit_output.group_context_hash;
         inner.seen_message_ids.clear();
         inner.seen_message_ids_order.clear();
-
         let (_ext_priv, ext_x25519_pub, _ext_kyber_sec, ext_kyber_pub) =
             GroupKeySchedule::derive_external_keypairs(&inner.init_secret)?;
         inner.external_x25519_public = ext_x25519_pub;
@@ -777,6 +788,7 @@ impl GroupSession {
             .inner
             .lock()
             .map_err(|_| ProtocolError::invalid_state("GroupSession lock poisoned"))?;
+        ensure_no_pending_reinit(&inner, "create_reinit_commit")?;
 
         let my_leaf_idx = inner.my_leaf_idx;
         let init_secret = Zeroizing::new(inner.init_secret.clone());
@@ -822,6 +834,20 @@ impl GroupSession {
         inner.group_context_hash = commit_output.group_context_hash;
         inner.seen_message_ids.clear();
         inner.seen_message_ids_order.clear();
+        inner.pending_reinit = Some(ReInitInfo {
+            new_group_id: commit_output
+                .commit
+                .proposals
+                .iter()
+                .find_map(|proposal| match &proposal.proposal {
+                    Some(crate::proto::group_proposal::Proposal::ReInit(reinit)) => {
+                        Some(reinit.new_group_id.clone())
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| ProtocolError::group_protocol("ReInit proposal missing"))?,
+            new_version,
+        });
 
         let (_ext_priv, ext_x25519_pub, _ext_kyber_sec, ext_kyber_pub) =
             GroupKeySchedule::derive_external_keypairs(&inner.init_secret)?;
@@ -851,6 +877,7 @@ impl GroupSession {
             .inner
             .lock()
             .map_err(|_| ProtocolError::invalid_state("GroupSession lock poisoned"))?;
+        ensure_no_pending_reinit(&inner, "process_commit")?;
 
         let my_leaf_idx = inner.my_leaf_idx;
         let init_secret = Zeroizing::new(inner.init_secret.clone());
@@ -938,6 +965,7 @@ impl GroupSession {
             .inner
             .lock()
             .map_err(|_| ProtocolError::invalid_state("GroupSession lock poisoned"))?;
+        ensure_no_pending_reinit(&inner, "export_public_state")?;
 
         let confirmation_mac = GroupKeySchedule::compute_confirmation_mac(
             &inner.epoch_keys.confirmation_key,
@@ -963,8 +991,68 @@ impl GroupSession {
         Ok(bytes)
     }
 
+    pub fn authorize_external_join(
+        &self,
+        joiner_identity_ed25519_public: &[u8],
+        joiner_identity_x25519_public: &[u8],
+        joiner_credential: &[u8],
+    ) -> Result<Vec<u8>, ProtocolError> {
+        if joiner_identity_ed25519_public.len() != ED25519_PUBLIC_KEY_BYTES {
+            return Err(ProtocolError::invalid_input(
+                "authorize_external_join: invalid joiner Ed25519 public key size",
+            ));
+        }
+        if joiner_identity_x25519_public.len() != X25519_PUBLIC_KEY_BYTES {
+            return Err(ProtocolError::invalid_input(
+                "authorize_external_join: invalid joiner X25519 public key size",
+            ));
+        }
+        if joiner_credential.len() > MAX_CREDENTIAL_SIZE {
+            return Err(ProtocolError::invalid_input(format!(
+                "authorize_external_join: credential too large (max {MAX_CREDENTIAL_SIZE})",
+            )));
+        }
+
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| ProtocolError::invalid_state("GroupSession lock poisoned"))?;
+        ensure_no_pending_reinit(&inner, "authorize_external_join")?;
+        if inner.security_policy.block_external_join {
+            return Err(ProtocolError::group_protocol(
+                "External join blocked by group security policy",
+            ));
+        }
+
+        let mut auth = GroupExternalJoinAuthorization {
+            group_id: inner.group_id.clone(),
+            epoch: inner.epoch,
+            joiner_identity_ed25519_public: joiner_identity_ed25519_public.to_vec(),
+            joiner_identity_x25519_public: joiner_identity_x25519_public.to_vec(),
+            joiner_credential: joiner_credential.to_vec(),
+            authorizer_leaf_index: inner.my_leaf_idx,
+            authorizer_signature: Vec::new(),
+        };
+        let mut auth_bytes = Vec::new();
+        auth.encode(&mut auth_bytes)
+            .map_err(|e| ProtocolError::encode(format!("External join auth encode: {e}")))?;
+
+        let mut ed25519_sk = inner
+            .my_ed25519_secret
+            .read_bytes(ED25519_SECRET_KEY_BYTES)
+            .map_err(ProtocolError::from_crypto)?;
+        auth.authorizer_signature = Self::ed25519_sign_group_message(&ed25519_sk, &auth_bytes)?;
+        CryptoInterop::secure_wipe(&mut ed25519_sk);
+
+        let mut signed = Vec::new();
+        auth.encode(&mut signed)
+            .map_err(|e| ProtocolError::encode(format!("External join auth encode: {e}")))?;
+        Ok(signed)
+    }
+
     pub fn from_external_join(
         public_state_bytes: &[u8],
+        authorization_bytes: &[u8],
         identity: &IdentityKeys,
         credential: Vec<u8>,
     ) -> Result<(Self, Vec<u8>), ProtocolError> {
@@ -975,12 +1063,16 @@ impl GroupSession {
         let public_state = GroupPublicState::decode(public_state_bytes)
             .map_err(|e| ProtocolError::decode(format!("GroupPublicState decode: {e}")))?;
 
-        let security_policy =
-            GroupSecurityPolicy::from_proto_bytes(&public_state.security_policy)?;
+        let security_policy = GroupSecurityPolicy::from_proto_bytes(&public_state.security_policy)?;
         security_policy.validate()?;
         if security_policy.block_external_join {
             return Err(ProtocolError::group_protocol(
                 "External join blocked by group security policy",
+            ));
+        }
+        if authorization_bytes.is_empty() {
+            return Err(ProtocolError::group_protocol(
+                "External join authorization is required",
             ));
         }
 
@@ -1063,6 +1155,7 @@ impl GroupSession {
                 crate::proto::GroupExternalInitProposal {
                     ephemeral_x25519_public: eph_x25519_pub,
                     kyber_ciphertext: kyber_ct,
+                    authorization: authorization_bytes.to_vec(),
                 },
             )),
         };
@@ -1195,6 +1288,7 @@ impl GroupSession {
         gpt: &GroupPlaintext,
         seal_key: &[u8],
         franking_tag_wire: &[u8],
+        mandatory_franking: bool,
     ) -> Result<
         (
             Vec<u8>,
@@ -1245,6 +1339,12 @@ impl GroupSession {
         } else {
             None
         };
+
+        if mandatory_franking && gpt.franking_key.is_empty() {
+            return Err(ProtocolError::franking_failed(
+                "Group security policy requires franking on every message",
+            ));
+        }
 
         if !gpt.franking_key.is_empty() && franking_tag_wire.is_empty() {
             return Err(ProtocolError::franking_failed(
@@ -1446,8 +1546,7 @@ impl GroupSession {
             ));
         }
 
-        let franking_override =
-            inner.security_policy.mandatory_franking && !policy.frankable;
+        let franking_override = inner.security_policy.mandatory_franking && !policy.frankable;
         let effective_policy;
         let policy = if franking_override {
             effective_policy = MessagePolicy {
@@ -1475,8 +1574,7 @@ impl GroupSession {
         let (generation, mut message_key) = inner.sender_store.next_own_message_key(my_leaf_idx)?;
 
         let remaining = policy_max.saturating_sub(generation);
-        let warning_threshold =
-            policy_max / (100 / SENDER_KEY_EXHAUSTION_WARNING_PERCENT);
+        let warning_threshold = policy_max / (100 / SENDER_KEY_EXHAUSTION_WARNING_PERCENT);
         if remaining <= warning_threshold {
             if let Some(handler) = &inner.event_handler {
                 handler.on_sender_key_exhaustion_warning(remaining, policy_max);
@@ -1652,10 +1750,7 @@ impl GroupSession {
         )
     }
 
-    pub fn encrypt_delete(
-        &self,
-        target_message_id: &[u8],
-    ) -> Result<Vec<u8>, ProtocolError> {
+    pub fn encrypt_delete(&self, target_message_id: &[u8]) -> Result<Vec<u8>, ProtocolError> {
         self.encrypt_internal(
             b"",
             &MessagePolicy {
@@ -1798,8 +1893,20 @@ impl GroupSession {
 
         let prev_message_hash = group_plaintext.prev_message_hash.clone();
 
-        let (plaintext, content_type, sealed_payload, franking_data, ttl_seconds, sent_timestamp, referenced_message_id) =
-            Self::parse_group_plaintext(&group_plaintext, &seal_key, &app_msg.franking_tag)?;
+        let (
+            plaintext,
+            content_type,
+            sealed_payload,
+            franking_data,
+            ttl_seconds,
+            sent_timestamp,
+            referenced_message_id,
+        ) = Self::parse_group_plaintext(
+            &group_plaintext,
+            &seal_key,
+            &app_msg.franking_tag,
+            inner.security_policy.mandatory_franking,
+        )?;
 
         if sealed_payload.is_none() {
             CryptoInterop::secure_wipe(&mut seal_key);
@@ -2146,8 +2253,7 @@ impl GroupSession {
             init_secret: std::mem::take(&mut state.init_secret),
         };
 
-        let security_policy =
-            GroupSecurityPolicy::from_proto_bytes(&state.security_policy)?;
+        let security_policy = GroupSecurityPolicy::from_proto_bytes(&state.security_policy)?;
         security_policy.validate()?;
 
         let mut chains = std::collections::BTreeMap::new();
@@ -2162,7 +2268,8 @@ impl GroupSession {
             )?;
             chains.insert(sc.leaf_index, chain);
         }
-        let sender_store = SenderKeyStore::from_chains(chains, security_policy.effective_max_skipped_per_sender());
+        let sender_store =
+            SenderKeyStore::from_chains(chains, security_policy.effective_max_skipped_per_sender());
 
         let seen_ids = std::mem::take(&mut state.seen_message_ids);
         let seen_set: HashSet<Vec<u8>> = seen_ids.iter().cloned().collect();
