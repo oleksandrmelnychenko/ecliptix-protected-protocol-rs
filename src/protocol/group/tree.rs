@@ -263,7 +263,7 @@ fn log2(x: u32) -> Result<u32, ProtocolError> {
     if x == 0 {
         return Err(ProtocolError::tree_integrity("log2(0) is undefined"));
     }
-    Ok(31 - x.leading_zeros())
+    Ok(x.ilog2())
 }
 
 #[inline]
