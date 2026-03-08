@@ -18,7 +18,7 @@ let package = Package(
         .binaryTarget(
             name: "EcliptixProtectedProtocol",
             url: "https://github.com/oleksandrmelnychenko/ecliptix-protected-protocol-rs/releases/download/v1.0.2/ecliptix-protected-protocol.xcframework.zip",
-            checksum: "0000000000000000000000000000000000000000000000000000000000000000"
+            checksum: "468d893d3d3ad8038658eb3ae74676abd4488722f6718f704a5b1b3e892081fa"
         ),
         .target(
             name: "EcliptixProtectedProtocolSwift",
